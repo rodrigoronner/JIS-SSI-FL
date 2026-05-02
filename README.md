@@ -9,7 +9,7 @@
 
 ## Overview
 
-This repository implements a decentralized identity verification protocol for Federated Learning (FL) in Internet-distributed environments. By integrating W3C Self-Sovereign Identity (SSI) standards (DIDs, VCs) with blockchain smart contracts, the protocol provides deterministic Sybil attack resistance through proactive institutional identity verification rather than reactive reputation scoring.
+This repository implements a decentralized identity verification protocol for Federated Learning (FL) in Internet-distributed environments. By integrating W3C Self-Sovereign Identity (SSI) standards (DIDs, VCs) with blockchain smart contracts, the protocol provides deterministic Sybil-resistance through proactive institutional identity verification rather than reactive reputation scoring.
 
 ### Key Features
 
@@ -24,8 +24,6 @@ This repository implements a decentralized identity verification protocol for Fe
 
 ```
 JISA-SSI-FL/
-├── paper/                       # JISA submission files
-│   └── jisa/                    # LaTeX source, figures, cover letter
 ├── contracts/                   # Ethereum Smart Contracts
 │   └── FLRegistry.sol          # DID/VC verification + access control
 ├── scripts/                     # Deployment and utilities
@@ -195,17 +193,6 @@ After 100 rounds, the simulation outputs final metrics to console. Representativ
 
 The cost model $C(N,R)$ can be projected from console gas logs or the analytical formula $C(N,R) = 0.067N + 0.009NR + 0.06R$.
 
-## Citation
-
-```bibtex
-@article{tertulino2025jisa,
-  title   = {A Decentralized Identity Protocol for Trustworthy Federated Learning:
-             Comparative Analysis of Trust Models for Internet-Based Health Services},
-  author  = {Rodrigo Tertulino and Ricardo Almeida and Laercio Alencar},
-  journal = {Journal of Internet Services and Applications},
-  year    = {2025},
-}
-```
 
 ## Acknowledgments
 
