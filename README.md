@@ -5,7 +5,7 @@
 [![Hardhat](https://img.shields.io/badge/built%20with-Hardhat-FFDB1C.svg)](https://hardhat.org/)
 [![JISA](https://img.shields.io/badge/submitted-JISA-orange)](https://journals-sol.sbc.org.br/index.php/jisa)
 
-> Official implementation accompanying: **"A Decentralized Identity Protocol for Trustworthy Federated Learning: Comparative Analysis of Trust Models for Internet-Based Health Services"** — submitted to the *Journal of Internet Services and Applications (JISA)*.
+> Official implementation accompanying: **"An Identity-First Software Architecture for Secure Federated Learning in Healthcare: Integrating Self-Sovereign Identity with Blockchain-Based Access Control"** — submitted to the *Journal of Internet Services and Applications (JISA)*.
 
 ## Overview
 
@@ -180,7 +180,7 @@ Sybil attack simulation complete:
 
 ### Step 7: Verify results
 
-After 100 rounds, the simulation outputs final metrics to console. Representative results:
+After 100 rounds, the simulation outputs final metrics to the console. Representative results:
 
 | Metric | T3 (SSI-FL, under attack) | T0 (no auth, under attack) |
 |--------|--------------------------|---------------------------|
