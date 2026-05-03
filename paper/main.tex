@@ -1,0 +1,361 @@
+\documentclass[english]{sbc2025}
+
+\usepackage[misc,geometry]{ifsym}
+\usepackage{aas_macros}
+\usepackage[bottom]{footmisc}
+\usepackage{url}
+\usepackage{pifont}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{listings}
+\usepackage{balance}
+
+\setcitestyle{square}
+
+\definecolor{orcidlogo}{rgb}{0.37,0.48,0.13}
+\definecolor{unilogo}{rgb}{0.16, 0.26, 0.58}
+\definecolor{maillogo}{rgb}{0.58, 0.16, 0.26}
+\definecolor{darkblue}{rgb}{0.0,0.0,0.0}
+\hypersetup{colorlinks,breaklinks,
+            linkcolor=darkblue,urlcolor=darkblue,
+            anchorcolor=darkblue,citecolor=darkblue}
+
+\jid{JIS}
+\issn{2763-7719}
+\jtitle{Journal on Interactive Systems, 2026, 17:1}
+\doi{10.5753/jis.2026.XXXX}
+\copyrightstatement{This work is licensed under a Creative Commons Attribution 4.0 International License}
+\jyear{2026}
+
+\category{Research Paper}
+
+\title[Architecture for Secure Federated Learning in Healthcare]{An Identity-First Software Architecture for Secure Federated Learning in Healthcare: Integrating Self-Sovereign Identity with Blockchain-Based Access Control}
+
+\author[Tertulino, 2026]{
+
+\affil{\textbf{Rodrigo Tertulino}~\orcidlink{0000-0002-7594-9312}~\textcolor{blue}{\faEnvelopeO}~~[~{Federal Institute of Rio Grande do Norte (IFRN)}~|\href{mailto:rodrigo.tertulino@ifrn.edu.br}{~{\textit{rodrigo.tertulino@ifrn.edu.br}}}~]}
+
+}
+
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+\begin{document}
+
+\begin{frontmatter}
+\maketitle
+
+\begin{mail}
+Federal Institute of Education, Science, and Technology of Rio Grande do Norte (IFRN), Natal, RN, 59015-000, Brazil.
+\end{mail}
+
+\begin{abstract-en}
+Federated Learning enables healthcare institutions to collaboratively train machine learning models without sharing raw patient data, yet its decentralized design introduces critical identity management challenges that reputation-based approaches fail to address. This paper presents the design, implementation, and experimental evaluation of an identity-first software architecture that integrates Self-Sovereign Identity standards (Decentralized Identifiers and Verifiable Credentials) with blockchain-based smart contracts to enforce cryptographic identity verification before any participant contributes to the model training process. We detail the architectural components, interaction protocols, and design trade-offs that comprise the system's three logical layers, and we formalize the on-chain access-control logic that gates participation based on credential validity. Experiments conducted on the MIMIC-IV clinical dataset, comprising 546,028 admissions distributed across ten federated nodes, demonstrate that the architecture neutralizes 100\% of Sybil attacks while preserving clinical predictive performance (AUC = 0.954, Recall = 0.890, F1 = 0.883). The identity verification layer introduces less than 0.12\% computational overhead relative to local training, and a cost analysis across blockchain infrastructures confirms economic viability: per-round expenses reach \$0.01 on Layer-2 networks and cumulative costs total approximately \$18 for a complete 100-round training cycle. We further discuss the applicability of this architecture within the Brazilian healthcare ecosystem, considering LGPD compliance and integration with the Unified Health System.
+\end{abstract-en}
+
+\begin{keywords}
+Federated Learning, Self-Sovereign Identity, Software Architecture, Blockchain, Healthcare Informatics, Identity Management
+\end{keywords}
+
+\begin{dates}
+% This information will be inserted by the editors during the production stage.
+\noindent{\sffamily\textbf{Edited by:}}
+Full Name~\orcidlink{0000-0000-0000-0000}
+~~$\mid$~~ 
+{\sffamily\textbf{Received:}} DD Month YYYY
+~~$\bullet$~~
+{\sffamily\textbf{Accepted:}} DD Month YYYY
+~~$\bullet$~~
+{\sffamily\textbf{Published:}} DD Month YYYY
+\end{dates}
+
+\end{frontmatter}
+
+
+\section{Introduction}
+\label{sec:intro}
+
+The proliferation of electronic health records has generated an unprecedented volume of structured clinical data, enabling machine learning models that support diagnostic decisions, predict patient trajectories, and optimize treatment strategies \citep{mcmahan2017communication}. Realizing these benefits, however, demands data aggregation across institutions, a practice constrained by privacy regulations such as the European GDPR, the United States HIPAA, and Brazil's General Data Protection Law (Lei Geral de Prote\c{c}\~{a}o de Dados, LGPD) \citep{SAKAMOTO20213049}. These frameworks prevent the centralization of clinical datasets, creating a tension between the computational demands of modern machine learning and the legal imperative to protect patient confidentiality.
+
+Federated Learning (FL) resolves this tension by enabling collaborative model training without transferring raw patient data beyond institutional boundaries \citep{10.1145/3735125}. In a standard FL round, each participant trains a local model on private data and transmits only model updates (gradients or parameter vectors) to an aggregation node. While this design offers substantial privacy advantages over centralized approaches, it introduces a new class of security threats that the original FL formulation did not anticipate. Poisoning attacks allow adversaries to corrupt the global model by injecting malicious gradients \citep{campos2025flaegis}, and Sybil attacks enable a single adversary to acquire disproportionate influence by fabricating multiple counterfeit identities \citep{srivastava2024federated}. In clinical settings, where model predictions may directly inform treatment decisions through interactive clinical decision support systems, the consequences of either attack type extend well beyond performance degradation.
+
+The research community has responded by integrating blockchain technology into FL architectures, leveraging distributed ledgers for immutable audit trails and smart contract enforcement of participation \citep{ning2024blockchain}. These blockchain-augmented systems have demonstrably improved transparency. A careful analysis, however, reveals a persistent structural weakness: the prevailing trust model evaluates participants based on the statistical quality of previously submitted updates rather than on cryptographic proof of institutional identity \citep{nguyen2022latency}. Reputation-based mechanisms suffer from a fundamental cold-start problem and remain susceptible to adversaries who accumulate trust over extended periods before executing an attack.
+
+This paper addresses the identity management gap by designing, implementing, and experimentally validating an identity-first software architecture for secure federated learning in healthcare. The architecture integrates Self-Sovereign Identity (SSI) standards (Decentralized Identifiers, DIDs, and Verifiable Credentials, VCs) \citep{W3C_DID_2022,W3C2019} with Ethereum-based smart contracts that gate participation on cryptographic proof of institutional legitimacy. Unlike reputation-based approaches that infer trust from behavior, our architecture establishes trust deterministically by verifying credentials at the network boundary before any computation is expended.
+
+The contributions of this work are threefold. First, we provide a detailed software architecture specification for an identity-verified FL system, describing the components, interfaces, and interaction protocols across three logical layers, and analyzing the design decisions that shaped the architecture. Second, we validate the architecture through comprehensive experiments covering convergence stability, clinical prediction quality, Sybil attack resistance, computational overhead, and economic cost. Third, we situate the architecture within the Brazilian healthcare context, discussing LGPD compliance and integration with the Unified Health System (SUS).
+
+The remainder of this paper is organized as follows. Section \ref{sec:background} reviews related work. Section \ref{sec:architecture} describes the architecture. Section \ref{sec:methods} presents the experimental methodology. Section \ref{sec:results} reports and analyzes the empirical results. Section \ref{sec:discussion} discusses implications, limitations, and the Brazilian healthcare context. Section \ref{sec:conclusion} concludes.
+
+
+\section{Background and Related Work}
+\label{sec:background}
+
+This section positions our contribution within three intersecting research streams: FL security, blockchain-based learning architectures, and decentralized identity management.
+
+\subsection{Security Vulnerabilities in Healthcare Federated Learning}
+
+Research on FL security distinguishes between privacy threats, which aim to extract information about individual training samples, and integrity threats, which aim to corrupt the model itself \citep{jimenez2025security}. The latter category spans untargeted poisoning, which degrades overall accuracy, and targeted backdoor attacks that activate under specific input conditions. Campos et al. \citep{campos2025flaegis} characterize participants who inject poisoned updates as Byzantine clients, highlighting the difficulty of separating malicious gradients from legitimate statistical variation in non-IID medical data \citep{10.1145/3678182}.
+
+Sybil attacks represent a distinct structural threat that exploits network topology rather than model internals: by creating numerous fictitious identities, an adversary acquires disproportionate voting power \citep{10.1007/978-981-99-7032-2_3}. Defending against Sybil attacks is particularly challenging in open FL deployments, where any node presenting a valid network address and key pair may request participation. Reputation-based countermeasures, which assign trust scores based on historical contribution quality, are the most common defense. They exhibit, however, two structural limitations: a bootstrapping problem for legitimate new institutions and vulnerability to adversaries who strategically build reputation before attacking. These observations motivate our architectural choice to anchor trust in cryptographic credentials rather than behavioral heuristics.
+
+\subsection{Blockchain as Coordination Layer in Federated Learning}
+
+Blockchain-FL integration addresses two shortcomings of centralized aggregation: the single point of failure at the aggregation server and the absence of immutable contribution records. Ning et al. \citep{ning2024blockchain} provide a comprehensive classification of blockchain-FL architectures, identifying smart contract-mediated aggregation, incentive distribution, and audit trail maintenance as the three primary functions. Efficient implementations store only lightweight cryptographic commitments on-chain (hashes of model updates and participant identifiers), while actual parameter tensors reside in distributed content-addressed systems such as IPFS \citep{technologies12090168}. This hybrid pattern preserves immutability without proportionally scaling costs with model size, a design principle that informs our architecture.
+
+Incentive mechanisms represent another active area. Wang et al. \citep{wang2022blockchain} use Shapley values for equitable reward distribution, and Khan et al. \citep{khan2024rewardchain} extend this concept to medical IoT environments. Yet these mechanisms share an implicit assumption that incentives alone deter malicious behavior. In adversarial settings, the potential value of corrupting a clinical model may exceed any incentive, reinforcing the need for identity-based access control as a prerequisite.
+
+Despite these advances, identity management remains an open challenge in blockchain-FL literature \citep{qammar2023securing}. Accountability mechanisms that trace malicious updates post-hoc \citep{lo2022trustworthy} enable retrospective analysis but do not prevent the attack. Our architecture addresses this gap by making identity verification a precondition for participation.
+
+\subsection{Decentralized Identity and Self-Sovereign Identity}
+
+Self-Sovereign Identity shifts digital identity management from centralized providers to entities that control their own identifiers through cryptographic key pairs \citep{Soltani}. Two W3C standards form the technical foundation: DIDs are persistent identifiers that resolve to documents containing public keys and service endpoints, anchored on distributed ledgers \citep{W3C_DID_2022}; VCs are tamper-evident digital statements cryptographically signed by an issuer about a subject \citep{W3C2019}. Recent work has applied SSI to healthcare access control. L\'{o}pez Mart\'{i}nez et al. \citep{MARTINEZ2026104020} demonstrate role-based access control mapping stakeholder roles to FHIR permissions, while Cocco and Tonelli \citep{fi16120473} treat medical reports as verifiable credentials in patient-controlled wallets. Naghmouchi and Laurent \citep{Naghmouchi} provide a component-level analysis of SSI systems with attention to privacy-by-design principles, noting that SSI integration into automated machine learning workflows remains largely unexplored. Our work addresses this gap by applying SSI standards to participant authentication in federated model training, a novel domain requiring per-round credential verification and the coupling of identity proofs with gradient integrity guarantees.
+
+\subsection{The Brazilian Healthcare Data Landscape}
+
+Brazil's Unified Health System (SUS) is among the world's largest public healthcare systems, serving over 200 million citizens through a hierarchical network spanning a continent-sized territory \citep{paim2011brazilian}. Platforms such as e-SUS APS generate substantial clinical data volumes \citep{Lacerda2020}, yet this data remains geographically fragmented, limiting its utility for population-scale machine learning. Brazil's LGPD, enacted in 2018 and enforced since 2020, introduces requirements for data minimization, purpose limitation, and controller accountability that any healthcare ML system must satisfy \citep{LGPD}. The architecture we present is evaluated with these constraints in mind, as discussed in Section \ref{sec:discussion}.
+
+
+\section{System Architecture}
+\label{sec:architecture}
+
+This section describes the software architecture of the identity-verified FL system. We articulate the design principles, detail the components and interfaces across three logical layers, and formalize the interaction protocols.
+
+\subsection{Design Principles}
+
+The architecture satisfies five quality attributes. \textit{Security} mandates that no participant may influence the global model without valid institutional identity credentials, driving the strict coupling between identity verification and aggregation. \textit{Privacy} requires raw patient data to remain within institutional boundaries, a constraint the FL paradigm satisfies by design. \textit{Scalability} demands that verification cost does not scale with model complexity, motivating the storage of fixed-length cryptographic hashes on-chain rather than variable-length parameter tensors. \textit{Auditability} requires an immutable, chronological record of participation events, which a blockchain's append-only ledger naturally provides. \textit{Economic sustainability} requires operational costs to be cumulatively covered within institutional budgets, particularly for resource-constrained healthcare providers.
+
+These drivers yield three design principles. The \textit{identity-first principle} requires credential verification before any computation is expended on a participant's update. The \textit{separation of concerns principle} establishes a clear boundary between on-chain identity operations (computationally expensive, globally visible) and off-chain learning operations (computationally intensive, privacy-sensitive). The \textit{lease-privilege principle} grants participation rights per training round rather than indefinitely, enabling dynamic revocation without modifying blockchain state.
+
+\subsection{Architectural Overview}
+
+The system organizes into three logical layers, illustrated in Figure \ref{fig:architecture}. The Identity Layer implements SSI standards for institutional identity management. The Coordination Layer deploys smart contracts on Ethereum to enforce access control. The Learning Layer executes FedProx optimization and secure aggregation across authorized institutions.
+
+\begin{figure*}[h]
+\begin{center}
+{\includegraphics[width=1.0\textwidth]{figures/fig1_architecture.png}}
+\caption{Three-layer architecture of the identity-verified federated learning system. The Identity Layer manages DIDs and VCs; the Coordination Layer enforces access control through smart contracts that gate participation on credential validity; the Learning Layer executes federated training and aggregation exclusively on authorized contributions.}
+\label{fig:architecture}
+\end{center}
+\end{figure*}
+
+Each institution operates a local node comprising an identity wallet, an Ethereum client, an IPFS node, and a training module. The aggregation server, potentially operated by a consortium coordinator, interacts with the blockchain to retrieve authorized participant lists and with IPFS to fetch corresponding model updates.
+
+\subsection{Identity Layer}
+
+The Identity Layer establishes and cryptographically verifies institutional identity through two W3C standards. Each institution generates a Decentralized Identifier in the format \texttt{did:ethr:0x...}, with its public key anchored on-chain \citep{ALZAHRANI2026104780}. DIDs eliminate the single point of failure of centralized identity providers and enable consistent identities across multiple FL consortia.
+
+A designated Trusted Issuer, such as a national health authority, conducts off-chain due diligence on prospective participants, verifying licenses, ethics approvals, and regulatory compliance. Upon successful verification, the Issuer creates a VC cryptographically signed with its private key, attesting to the institution's attributes. Each credential carries issuance and expiration timestamps, a revocation registry endpoint, and supports selective disclosure, allowing institutions to prove authorization without revealing unnecessary attributes \citep{W3C2019}. The separation between Issuer (attesting to legitimacy through off-chain processes) and Verifier (the smart contract checking credentials on-chain) is a deliberate architectural choice that accommodates heterogeneous regulatory environments. A consortium spanning multiple jurisdictions can designate separate credential issuers operating under different accreditation frameworks while maintaining a unified technical infrastructure.
+
+\subsection{Coordination Layer}
+
+The Coordination Layer comprises two smart contracts deployed on Ethereum. The Registry Contract maintains an on-chain mapping from DIDs to authorization status, with the \texttt{AuthorizeWorker} function restricted to the designated Issuer address. The FL Task Contract manages individual training rounds, encoding eligibility requirements as contract state. Algorithm \ref{alg:smart_contract} formalizes the access control logic.
+
+\begin{algorithm}[h]
+\caption{Smart Contract Access Control Logic}
+\label{alg:smart_contract}
+\begin{algorithmic}[1]
+\REQUIRE Sender Address $addr_{sender}$, Model Update Hash $h_{model}$
+\STATE \textbf{Global State:} $Registry \leftarrow \{DID_{issuer}: \text{True}\}$
+\STATE \textbf{Event:} $UpdateAccepted(round, h_{model})$
+\STATE \textbf{// Function: AuthorizeWorker (Issuer-only)}
+\IF{$msg.sender \neq Issuer$}
+    \STATE \textbf{Revert} ``Unauthorized: Only designated Issuer can grant credentials''
+\ENDIF
+\STATE $Registry[addr_{worker}] \leftarrow \text{True}$
+\STATE \textbf{Emit} $WorkerAuthorized(addr_{worker})$
+\STATE
+\STATE \textbf{// Function: SubmitUpdate (FL Participant)}
+\STATE $is\_authorized \leftarrow Registry[msg.sender]$
+\IF{$is\_authorized$ is \textbf{False}}
+    \STATE \textbf{Revert} ``Access Denied: No Valid Verifiable Credential''
+\ENDIF
+\STATE $CurrentTask.hash \leftarrow h_{model}$
+\STATE \textbf{Emit} $UpdateAccepted(CurrentTask.round, h_{model})$
+\STATE \textbf{Return} True
+\end{algorithmic}
+\end{algorithm}
+
+A critical efficiency consideration: the contract stores boolean authorization flags and SHA-256 hashes, not model parameters. Since these occupy a fixed number of bytes regardless of model complexity, the gas cost of \texttt{SubmitUpdate} is invariant with respect to neural network architecture \citep{MADRIGALCIANCI2025107700}. Verifying a model with ten hidden layers costs the same as verifying a logistic regression model.
+
+To participate in a round, an institution submits a Verifiable Presentation derived from its VC. The contract validates the issuer signature against the Registry Contract's stored public key, checks expiration and revocation status, and matches credential attributes to task requirements. Successful verification adds the institution's DID to the authorized set for that round; failure causes the transaction to revert and excludes the submission from aggregation.
+
+\subsection{Learning Layer}
+
+The Learning Layer implements collaborative training using FedProx \citep{li2020federated}, which adds a proximal term $\mu \|w - w_{t-1}\|^2$ to the local objective to improve convergence under data heterogeneity. The local model is a Multi-Layer Perceptron with the following topology: Input (25 neurons) $\rightarrow$ Hidden 1 (64, ReLU, Dropout 0.2) $\rightarrow$ Hidden 2 (32, ReLU) $\rightarrow$ Output (1, Sigmoid). Optimization uses SGD with $\eta=0.01$, momentum $0.9$, weight decay $1 \times 10^{-5}$, and FedProx proximal term $\mu=0.01$. Each round consists of $E=3$ local epochs with batch size $B=32$.
+
+Model storage uses IPFS for content-addressed, decentralized file management \citep{technologies12090168}. After local training, each institution uploads updated parameters to IPFS and receives a Content Identifier (CID), a 46-byte cryptographic hash. Only this CID, signed with the institution's DID private key, is submitted on-chain. The aggregation server monitors blockchain events, retrieves models via IPFS, and computes a weighted average of validated updates using sample counts as weights. The new global model is uploaded to IPFS, and its CID is recorded on-chain for the next round.
+
+The end-to-end workflow follows a four-phase protocol: (1) credential issuance by the Trusted Issuer following off-chain institutional verification; (2) authentication via Verifiable Presentation submission, where the smart contract validates signatures and credential status before authorizing participation; (3) authenticated model update submission, where authorized institutions compute a CID for their locally trained parameters, sign it with their DID key, and submit it on-chain; and (4) secure aggregation, where the server collects accepted CIDs, retrieves models from IPFS, performs final signature verification, and computes the weighted average. This sequential dependency between phases 2 and 3 is the mechanism through which Sybil attack resistance is achieved. The adversary must compromise the Trusted Issuer's private key to produce a valid Verifiable Presentation, a substantially higher bar than generating arbitrary key pairs.
+
+
+\section{Experimental Design}
+\label{sec:methods}
+
+This section describes the experimental setup for validating the architecture.
+
+\subsection{Dataset and Preprocessing}
+
+Experiments used the MIMIC-IV database version 3.1 \citep{johnson2020mimic}, a de-identified clinical dataset from intensive care units at Beth Israel Deaconess Medical Center, deployed on a local PostgreSQL instance. A SQL pipeline extracted a cohort of 546,028 admissions with three inclusion criteria: adult patients (age $\geq$ 18), first admission per unique patient (ensuring sample independence), and non-null \texttt{hospital\_expire\_flag} (in-hospital mortality outcome).
+
+The feature set comprised 25 variables across demographics (age, gender, ethnicity, insurance type), clinical context (admission location, first care unit, Charlson Comorbidity Index), and physiological proxies (length of stay, ICD-10 groupings for sepsis and heart failure). Categorical variables were label-encoded to integer indices.
+
+To address the severe class imbalance characteristic of mortality prediction, the SMOTETomek algorithm \citep{batista2004balancing}, which combines synthetic minority over-sampling with Tomek Links removal, was applied exclusively to each client's local training folds. The validation and test sets preserved the original imbalanced distribution for realistic assessment. A strict chronological split (90\% training, 10\% testing) was used before any resampling, preventing information leakage.
+
+\subsection{Federated Simulation}
+
+The simulation comprised $K=10$ clients. To simulate realistic non-IID conditions, data were partitioned using a Dirichlet distribution with $\alpha=0.5$, creating substantial heterogeneity across participants. The federation ran for $R=100$ rounds with $E=3$ local epochs per round. Authorized clients submitted updates through the blockchain verification pipeline; unauthorized submissions were rejected before reaching the aggregator.
+
+\subsection{Attack Model}
+
+To evaluate security properties, we implemented a Sybil poisoning scenario in which five malicious nodes, representing 33\% of the effective network after injection at Round 10, submitted random noise updates from $\mathcal{N}(0, 1)$. Two configurations were compared: a baseline using standard FedAvg without identity verification, and the proposed configuration with on-chain credential verification enabled.
+
+\subsection{Evaluation Metrics}
+
+Evaluation covered five dimensions. \textit{Convergence} was assessed through global accuracy and loss trajectories. \textit{Clinical prediction} used AUC-ROC, precision, recall, and F1-score, with recall prioritized for its direct relationship to patient safety. \textit{Security} was quantified as the proportion of Sybil updates rejected. \textit{Overhead} was measured as additional latency from on-chain verification relative to local training. \textit{Economic viability} was assessed by measuring gas consumption across 100 rounds, converted to USD at representative rates (20 Gwei, ETH at \$3,000) \citep{coingecko2026}, with sensitivity analysis across different blockchain infrastructures.
+
+
+\section{Results and Analysis}
+\label{sec:results}
+
+\subsection{Convergence and Learning Performance}
+
+Stable convergence is a prerequisite for any FL system in clinical contexts. Figure \ref{fig:convergence} presents global accuracy and loss trajectories over 100 rounds. The model achieves rapid convergence, with accuracy rising from approximately 82\% in Round 1 to 88.1\% by Round 4 and maintaining stability for the remaining 96 rounds. The loss decreases smoothly and monotonically, asymptotically approaching $\mathcal{L} \approx 0.272$ without oscillations.
+
+\begin{figure*}[h]
+\begin{center}
+{\includegraphics[width=1.0\textwidth]{figures/fig2_convergence.png}}
+\caption{Convergence analysis over 100 federated rounds. The left panel shows global accuracy stabilizing around Round 4 at 88.1\%. The right panel shows monotonic loss minimization converging to $\mathcal{L} \approx 0.272$. The smooth behavior confirms that identity verification introduces no training instability.}
+\label{fig:convergence}
+\end{center}
+\end{figure*}
+
+This behavior confirms two architectural properties. First, the FedProx proximal term ($\mu=0.01$) effectively mitigates statistical heterogeneity arising from Dirichlet-distributed data partitioning. Second, the identity verification gate does not degrade convergence speed or final model quality; the learning dynamics are indistinguishable from an unverified system operating without adversaries.
+
+Regarding clinical prediction, the final global model achieved a precision of 0.876, a recall of 0.890, an F1-score of 0.883, and an AUC-ROC of 0.954 on a held-out test set of 54,603 admissions. The recall value, indicating that 89\% of patients who ultimately died were correctly identified, is clinically significant: false negatives represent missed opportunities for timely intervention. The confusion matrix revealed 5,342 true positives, 756 false positives, 659 false negatives, and 47,846 true negatives, confirming a conservative, safety-oriented classification strategy. While the model generated some false positives (patients incorrectly predicted to die), this trade-off is appropriate for intensive care settings, where the cost of additional monitoring for a surviving patient is far outweighed by the cost of missing a deteriorating patient.
+
+Data heterogeneity produced expected divergence in individual client performance, with trauma-specialty hospitals exhibiting lower baseline accuracy than general-care institutions. The global model consistently outperformed all individual local models after convergence, demonstrating effective knowledge synthesis across demographically distinct patient populations. This property directly validates the architectural decision to decouple local training (optimized for institutional data characteristics) from global aggregation (optimized for population-level generalization).
+
+\subsection{Sybil Attack Resistance}
+
+Figure \ref{fig:sybil} presents the security evaluation results. In the baseline configuration, introducing five Sybil nodes at Round 10 resulted in an immediate and severe accuracy collapse. By Round 50, the AUC-ROC had deteriorated from 0.954 to 0.813 (a 14.8\% reduction), recall had dropped to 0.700, and the false negative rate had increased from 11.0\% to 30.0\%. The standard FedAvg aggregator, unable to distinguish between legitimate gradient distributions and random noise, indiscriminately incorporated poisoned updates.
+
+\begin{figure*}[h]
+\begin{center}
+{\includegraphics[width=1.0\textwidth]{figures/fig3_sybil.jpg}}
+\caption{Impact of Sybil attack on global model accuracy. The baseline system (dashed red) suffers catastrophic degradation upon injection of five malicious nodes at Round 10. The identity-verified system (solid blue) maintains a trajectory identical to the attack-free scenario, as all unauthorized updates are rejected by the smart contract before reaching the aggregator.}
+\label{fig:sybil}
+\end{center}
+\end{figure*}
+
+In the proposed configuration, the smart contract's \texttt{SubmitUpdate} function rejected all five Sybil registration attempts because the adversary lacked valid Verifiable Credentials. The aggregator received updates exclusively from the ten legitimate institutions, and the global model maintained a trajectory indistinguishable from the attack-free scenario. At Round 50, all performance metrics matched the ideal values: AUC-ROC remained at 0.954, recall at 0.890, and the false negative rate remained unchanged at 11.0\%.
+
+A statistical comparison of accuracy values across the final 40 rounds confirmed significance ($t=17.29$, $p < 0.001$, Cohen's $d = 2.87$). These results demonstrate the central architectural argument: cryptographic identity verification provides deterministic defense against Sybil attacks, shifting the adversary's burden from the trivial task of generating random key pairs to the substantially harder challenge of compromising a trusted credential issuer.
+
+\subsection{Computational Overhead and Economic Feasibility}
+
+Figure \ref{fig:overhead} presents the operational cost analysis through two complementary perspectives: computational overhead (left panel) and cumulative economic cost (right panel). Local training operations consume approximately 17 seconds per round, while blockchain-based identity verification adds 0.02 seconds of additional latency, resulting in less than 0.12\% overhead. This efficiency results from the architectural decision to store only fixed-length cryptographic hashes on-chain.
+
+\begin{figure*}[h]
+\begin{center}
+{\includegraphics[width=1.0\textwidth]{figures/fig4_overhead_cost.png}}
+\caption{Operational overhead and economic viability. Left panel: Blockchain verification adds 0.02 seconds per round relative to 17 seconds of local training (0.12\% overhead). Right panel: Cumulative cost exhibits strictly linear growth ($R^2 \approx 1.0$), reaching approximately \$18 for 100 rounds, demonstrating predictable, non-escalating operational expenses.}
+\label{fig:overhead}
+\end{center}
+\end{figure*}
+
+The cumulative gas consumption exhibits strictly linear growth ($R^2 \approx 1.0$), confirming that the verification mechanism's per-unit cost remains constant throughout the federation. Total cost for 100 rounds is approximately \$18, a negligible fraction of typical clinical AI research budgets. When distributed across a consortium of ten hospitals, per-institution cost falls to approximately \$1.80.
+
+Table \ref{tab:gas_costs} provides sensitivity analysis across blockchain infrastructures. The prototyping cost on Ethereum Layer-1 (\$2.70/round at 20 Gwei) represents a conservative upper bound. Migrating to a Layer-2 Optimistic Rollup such as Arbitrum reduces costs by two orders of magnitude to \$0.01/round, and permissioned networks such as Hyperledger Fabric eliminate per-transaction costs entirely, though shifting expenses toward infrastructure maintenance \citep{HASSELGREN2020104040}. The existence of these alternatives confirms that financial constraints should not be the primary barrier to adopting identity-verified FL.
+
+\begin{table*}[h]
+\centering
+\caption{Cost Projection across Blockchain Infrastructures (Per Round)}
+\label{tab:gas_costs}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Network} & \textbf{Gas / Fee Model} & \textbf{Cost (USD)} & \textbf{Suitability} \\
+\midrule
+Ethereum (L1) & 20 Gwei & $\approx 2.70$ & Prototyping \\
+Arbitrum (L2) & 0.1 Gwei & $\approx 0.01$ & \textbf{Production} \\
+Hyperledger (Perm.) & No gas & $\approx 0.00$ & Enterprise \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Architectural Implications}
+
+The identity-first pattern demonstrated in this work suggests a rethinking of trust establishment in collaborative computing. Traditional FL security techniques (differential privacy, secure multi-party computation, robust aggregation) address data confidentiality and integrity in transit and at rest, but leave unanswered the fundamental question of \textit{who} is sending the data. Our results indicate that complementing these mechanisms with cryptographic identity verification at the network boundary yields a security posture that no single layer can achieve on its own.
+
+The architecture's separation between credential issuer and smart contract verifier is particularly relevant for multi-jurisdictional healthcare governance. A consortium spanning Brazil, the European Union, and the United States could designate separate credential issuers, each operating under its own national accreditation framework, while maintaining a unified technical infrastructure for model training. This design reconciles fragmented regulatory landscapes through standardized collaborative learning.
+
+\subsection{Applicability to the Brazilian Healthcare Context}
+
+The Brazilian SUS presents both challenges and opportunities for federated learning. Serving over 200 million citizens through a hierarchical network of primary care units, specialized clinics, and tertiary hospitals \citep{paim2011brazilian}, SUS generates substantial clinical data through platforms such as e-SUS APS \citep{Lacerda2020}. Yet this data remains geographically fragmented across the country's vast territory.
+
+The credential issuance model naturally aligns with Brazil's existing health authority hierarchy. The Ministry of Health, state health secretariats, and municipal health departments could serve as credential issuers at their respective jurisdictional levels. The blockchain audit trail satisfies SUS governance transparency requirements, providing verifiable records of institutional contributions for regulatory oversight.
+
+Regarding LGPD compliance \citep{LGPD}, the FL paradigm satisfies the data minimization principle by keeping raw patient data local. Selective disclosure via VCs enables institutions to prove authorization without revealing unnecessary attributes, thereby supporting purpose limitation. The immutable blockchain record provides mechanisms for demonstrating compliance during audits, a requirement under LGPD Article 38. However, the potential tension between blockchain immutability and the LGPD right to erasure (Article 18) warrants attention. While model hashes and authorization events constitute operational metadata rather than personal data, implementations must ensure that no personal information is inadvertently written to the immutable ledger.
+
+\subsection{Limitations and Future Work}
+
+Several limitations merit acknowledgment. The experimental evaluation used a single dataset (MIMIC-IV) and a single task (mortality prediction); generalization to other clinical domains and interactive systems requires validation. The attack model considered only Sybil attacks with random noise, the most straightforward adversarial strategy. Insider threats, where authorized but compromised institutions submit poisoned updates, require complementary Byzantine-robust aggregation rules \citep{11230563, 10.1145/3658644.3670307} or behavioral anomaly detection \citep{WANG2025126354}, both of which are compatible with our architecture but not evaluated here. Credential lifecycle management, including periodic re-certification, revocation propagation latency, and issuer key compromise recovery, warrants dedicated investigation in operational deployments.
+
+Future work should extend the architecture to multi-modal clinical data (imaging, time-series, unstructured text), integrate differential privacy mechanisms for defense-in-depth \citep{abadi2016deep}, and conduct longitudinal studies in operational healthcare settings. These studies should characterize real-world performance under network variability, participation churn, and the ergonomics of key management for clinical staff interacting with the federated system.
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This paper presented the design, implementation, and experimental evaluation of an identity-first software architecture for secure federated learning in healthcare. By integrating Self-Sovereign Identity standards with blockchain-based smart contracts, the architecture enforces cryptographic identity verification as a precondition for participation, thereby departing from the reputation-based trust models that dominate existing proposals.
+
+Experimental validation on the MIMIC-IV dataset distributed across ten federated nodes demonstrated that the architecture neutralizes 100\% of Sybil attack attempts while preserving strong clinical predictive performance (AUC = 0.954, Recall = 0.890, F1 = 0.883). The verification layer introduced less than 0.12\% computational overhead, and a comprehensive cost analysis confirmed economic viability across blockchain infrastructure configurations. Per-round costs reached \$0.01 on Layer-2 networks, with cumulative expenses of approximately \$18 for a complete 100-round training cycle. The architecture's suitability for the Brazilian healthcare context was discussed, with attention to alignment with SUS governance and compliance with LGPD.
+
+These results support the broader thesis that identity-first architectural patterns offer a viable, scalable, and economically sustainable foundation for inter-institutional healthcare machine learning. The applicability of this approach extends beyond healthcare to domains where cryptographic proof of participant identity can enhance the security posture of decentralized collaborative computation.
+
+
+\begin{declarations}
+
+\begin{acknowledgements}
+The author gratefully acknowledges the computational resources and institutional support provided by the Software Engineering and Automation Research Laboratory at the Federal Institute of Education, Science, and Technology of Rio Grande do Norte (IFRN). We extend our appreciation to the MIT Laboratory for Computational Physiology for maintaining and providing open access to the MIMIC-IV database.
+\end{acknowledgements}
+
+\begin{funding}
+The author declares that no funds, grants, or other support were received during the preparation of this manuscript.
+\end{funding}
+
+\begin{contributions}
+Rodrigo Tertulino contributed to the conception of this study, designed the architecture, performed the experiments, analyzed the data, and wrote the manuscript. The author read and approved the final manuscript.
+\end{contributions}
+
+\begin{interests}
+The author declares that they have no competing interests.
+\end{interests}
+
+\begin{materials}
+The datasets analyzed during the current study are available from PhysioNet (MIMIC-IV v3.1) under credentialed access at \url{https://physionet.org/content/mimiciv/}. Access to MIMIC-IV requires completion of a CITI Program training course in human subjects research and acceptance of the PhysioNet data use agreement. The source code developed for this study is publicly available at \url{https://github.com/rodrigoronner/TBFL-EHR-Framework}.
+\end{materials}
+
+\begin{furtherinformation}
+
+In accordance with the instructions for authors and the submission checklist item, any use of AI must be fully disclosed and appropriately explained in the submitted manuscript. The use of Artificial Intelligence tools in the production of the manuscript must be duly indicated in this section.
+
+\textbf{AI Disclosure.} During the preparation of this manuscript, the author used AI-assisted tools for language polishing, grammar refinement, and stylistic editing of the text. All research design, experimental methodology, data analysis, results, and conclusions are the original intellectual work of the author. No AI tools were used to generate, analyze, or manipulate research data. The author reviewed, edited, and takes full responsibility for all content in this manuscript.
+
+\textbf{Ethical Considerations.} The MIMIC-IV database is a de-identified, publicly available clinical dataset. Access is governed by PhysioNet's credentialed access process, which requires researchers to complete training in human subjects research and to sign a data use agreement prohibiting re-identification attempts. As a retrospective study using de-identified data, this research was conducted in accordance with PhysioNet's data use policies and did not require additional ethics committee review.
+
+\end{furtherinformation}
+
+\end{declarations}
+
+
+\bibliographystyle{apalike-sol}
+\balance
+\bibliography{references_jbcs}
+
+\end{document}
