@@ -22,7 +22,7 @@ This repository implements a decentralized identity verification protocol for Fe
 
 ### Dataset setup notice
 
-**No dataset ships with this repository.** MIMIC-IV is credentialed-access data under a PhysioNet Data Use Agreement and must never be committed to a public repo. `data/` is empty except for instructions; generate `data/mortalidade_features.csv` yourself with [`sql/extract_cohort.sql`](sql/extract_cohort.sql) — see [`data/README.md`](data/README.md) for the exact steps. That query includes `admittime` (needed for the paper's chronological 90/10 split), Charlson Comorbidity Index, length of stay, and ICD-10 sepsis/heart-failure flags — the full feature set described in Sec. 4.1. It has not yet been executed against a live MIMIC-IV instance; validate its output shape/columns against your own database before relying on it.
+**No dataset ships with this repository.** MIMIC-IV is credentialed-access data under a PhysioNet Data Use Agreement and must never be committed to a public repo. `data/` is empty except for instructions; generate `data/mortalidade_features.csv` yourself with [`sql/extract_cohort.sql`](sql/extract_cohort.sql) — see [`data/README.md`](data/README.md) for the exact steps. That query includes `admittime` (needed for the paper's chronological 90/10 split), Charlson Comorbidity Index, length of stay, and ICD-10 sepsis/heart-failure flags — the full feature set described in Sec. 4.1.
 
 ## Repository Structure
 
