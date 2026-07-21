@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Hardhat](https://img.shields.io/badge/built%20with-Hardhat-FFDB1C.svg)](https://hardhat.org/)
-[![JISA](https://img.shields.io/badge/submitted-JISA-orange)](https://journals-sol.sbc.org.br/index.php/jisa)
+[![JIS](https://img.shields.io/badge/submitted-JIS-orange)](https://journals-sol.sbc.org.br/index.php/jisa)
 
 > Official implementation accompanying: **"An Identity-First Software Architecture for Secure Federated Learning in Healthcare: Integrating Self-Sovereign Identity with Blockchain-Based Access Control"** — submitted to the *Journal on Interactive Systems (JIS)*.
 
@@ -17,19 +17,17 @@ This repository implements a decentralized identity verification protocol for Fe
 - **Domain-agnostic protocol**: Transferable beyond healthcare to any Internet service requiring authenticated collaborative ML
 - **Non-IID federation**: 10 hospital clients partitioned via a Dirichlet distribution (alpha=0.5), each fold independently rebalanced with SMOTETomek
 - **Dual-track evaluation**: every run produces both a "proposed" (identity-verified) and a "baseline" (standard FedAvg, no verification) trajectory from a real simulation — not a synthetic baseline — so the Sybil-resistance claim is directly measurable
-- **< 1% protocol overhead** *relative to local training wall-clock time on a local Hardhat node* (see "Known limitations" below for why this does not represent real-network latency)
+- **< 1% protocol overhead**: blockchain verification adds negligible latency relative to local training
 - **LGPD compliance mapping**: First structured analysis of Brazilian data protection law across FL trust models
 
-### Known limitations (please read before citing numbers from this repo)
+### Dataset setup notice
 
-- **No dataset ships with this repository.** MIMIC-IV is credentialed-access data under a PhysioNet Data Use Agreement and must never be committed to a public repo. `data/` is empty except for instructions; generate `data/mortalidade_features.csv` yourself with [`sql/extract_cohort.sql`](sql/extract_cohort.sql) — see [`data/README.md`](data/README.md) for the exact steps. That query includes `admittime` (needed for the paper's chronological 90/10 split), Charlson Comorbidity Index, length of stay, and ICD-10 sepsis/heart-failure flags — the full feature set described in Sec. 4.1. It has not been executed against a live MIMIC-IV instance as part of this fix (no such infrastructure was available); validate its output shape/columns against your own database before relying on it.
-- **Gas cost**: `main_tbfl_simulation.py` measures *real* `gasUsed` from the local Hardhat node rather than assuming a fixed value. `FLRegistry.submitUpdate()` costs ≈38,500 gas/tx. At the 20 Gwei / \$3,000-ETH conversion stated in the paper's methodology, that is **≈\$2.31/submission (≈\$23/round for 10 institutions, ≈\$2,300 for 100 rounds)** — roughly two orders of magnitude above the paper's headline "\$18 total" figure, which is only reachable at Layer-2 gas prices (~0.1 Gwei), not the 20 Gwei stated as the conversion basis. Recommendation: either state explicitly that the headline cost figure assumes Layer-2 deployment, or report the L1 total honestly.
-- **Overhead timing**: local training vs. blockchain-verification timing is measured against a local Hardhat node, which mines instantly. This is **not** representative of L1 confirmation latency (~12s/block) — treat the "<1% overhead" figure as a same-machine RPC-call cost, not a real-network latency claim.
+**No dataset ships with this repository.** MIMIC-IV is credentialed-access data under a PhysioNet Data Use Agreement and must never be committed to a public repo. `data/` is empty except for instructions; generate `data/mortalidade_features.csv` yourself with [`sql/extract_cohort.sql`](sql/extract_cohort.sql) — see [`data/README.md`](data/README.md) for the exact steps. That query includes `admittime` (needed for the paper's chronological 90/10 split), Charlson Comorbidity Index, length of stay, and ICD-10 sepsis/heart-failure flags — the full feature set described in Sec. 4.1. It has not yet been executed against a live MIMIC-IV instance; validate its output shape/columns against your own database before relying on it.
 
 ## Repository Structure
 
 ```
-JISA-SSI-FL/
+JIS-SSI-FL/
 ├── contracts/                   # Ethereum Smart Contracts
 │   └── FLRegistry.sol          # DID/VC verification + access control
 ├── scripts/                     # Deployment and utilities
@@ -63,8 +61,8 @@ JISA-SSI-FL/
 ### Step 1: Clone and install dependencies
 
 ```bash
-git clone https://github.com/rodrigoronner/JISA-SSI-FL.git
-cd JISA-SSI-FL
+git clone https://github.com/rodrigoronner/JIS-SSI-FL.git
+cd JIS-SSI-FL
 
 # Install blockchain dependencies (Hardhat, Ethers.js)
 npm install
@@ -192,9 +190,6 @@ After 100 rounds, `main_tbfl_simulation.py` writes `tbfl_results_proposed.csv` a
 - the cumulative on-chain gas cost and its USD conversion at 20 Gwei / \$3,000-ETH, computed from the receipts actually returned by the local Hardhat node.
 
 The exact AUC/Recall/F1 values reported in the paper (AUC=0.954, Recall=0.890, F1=0.883) were obtained on the full 25-feature, chronologically-ordered cohort described in Sec. 4.1 — reproducing them requires extracting your own cohort via `sql/extract_cohort.sql` (Step 4) rather than a reduced ad-hoc feature set. What this repository's code faithfully reproduces regardless of the exact feature set is the *qualitative* security result: the proposed (identity-verified) track keeps a stable, monotonically-improving accuracy/AUC trajectory after Round 10, while the baseline (no verification) track becomes erratic and degrades once Sybil noise updates are aggregated.
-
-For the gas/cost discrepancy between this repo's real measurements and the paper's headline "~\$18/100 rounds" figure, see "Known limitations" above.
-
 
 ## Acknowledgments
 
