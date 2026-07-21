@@ -15,10 +15,16 @@ This repository implements a decentralized identity verification protocol for Fe
 
 - **100% external Sybil attack neutralization**: Only DIDs with valid Verifiable Credentials can participate
 - **Domain-agnostic protocol**: Transferable beyond healthcare to any Internet service requiring authenticated collaborative ML
-- **Clinical-grade performance**: AUC-ROC = 0.954, Recall = 0.890 on MIMIC-IV mortality prediction
-- **< 1% protocol overhead**: Blockchain verification + IPFS storage incurs negligible latency relative to local training
-- **Analytical cost model**: Enables pre-deployment economic planning (~$15.67 for N=10 over 100 rounds)
+- **Non-IID federation**: 10 hospital clients partitioned via a Dirichlet distribution (alpha=0.5), each fold independently rebalanced with SMOTETomek
+- **Dual-track evaluation**: every run produces both a "proposed" (identity-verified) and a "baseline" (standard FedAvg, no verification) trajectory from a real simulation — not a synthetic baseline — so the Sybil-resistance claim is directly measurable
+- **< 1% protocol overhead** *relative to local training wall-clock time on a local Hardhat node* (see "Known limitations" below for why this does not represent real-network latency)
 - **LGPD compliance mapping**: First structured analysis of Brazilian data protection law across FL trust models
+
+### Known limitations (please read before citing numbers from this repo)
+
+- **No dataset ships with this repository.** MIMIC-IV is credentialed-access data under a PhysioNet Data Use Agreement and must never be committed to a public repo. `data/` is empty except for instructions; generate `data/mortalidade_features.csv` yourself with [`sql/extract_cohort.sql`](sql/extract_cohort.sql) — see [`data/README.md`](data/README.md) for the exact steps. That query includes `admittime` (needed for the paper's chronological 90/10 split), Charlson Comorbidity Index, length of stay, and ICD-10 sepsis/heart-failure flags — the full feature set described in Sec. 4.1. It has not been executed against a live MIMIC-IV instance as part of this fix (no such infrastructure was available); validate its output shape/columns against your own database before relying on it.
+- **Gas cost**: `main_tbfl_simulation.py` measures *real* `gasUsed` from the local Hardhat node rather than assuming a fixed value. `FLRegistry.submitUpdate()` costs ≈38,500 gas/tx. At the 20 Gwei / \$3,000-ETH conversion stated in the paper's methodology, that is **≈\$2.31/submission (≈\$23/round for 10 institutions, ≈\$2,300 for 100 rounds)** — roughly two orders of magnitude above the paper's headline "\$18 total" figure, which is only reachable at Layer-2 gas prices (~0.1 Gwei), not the 20 Gwei stated as the conversion basis. Recommendation: either state explicitly that the headline cost figure assumes Layer-2 deployment, or report the L1 total honestly.
+- **Overhead timing**: local training vs. blockchain-verification timing is measured against a local Hardhat node, which mines instantly. This is **not** representative of L1 confirmation latency (~12s/block) — treat the "<1% overhead" figure as a same-machine RPC-call cost, not a real-network latency claim.
 
 ## Repository Structure
 
@@ -31,9 +37,12 @@ JISA-SSI-FL/
 ├── src/                         # Federated Learning Core
 │   ├── main_tbfl_simulation.py # Main execution script (100 rounds)
 │   ├── blockchain_manager.py   # Web3 interface
+│   ├── data_loader.py          # Chronological split, Dirichlet partition, SMOTETomek
 │   └── cliente_fl.py           # FL client (hospital) with FedProx
-├── data/                        # Preprocessed MIMIC-IV cohort
-│   └── mortalidade_features.csv.zip
+├── sql/
+│   └── extract_cohort.sql      # MIMIC-IV v3.1 cohort/feature extraction query
+├── data/                        # Empty — see data/README.md to generate the cohort yourself
+│   └── README.md
 ├── hardhat.config.js            # Hardhat configuration
 ├── package.json                 # Node.js dependencies
 ├── requirements.txt             # Python dependencies
@@ -47,7 +56,7 @@ JISA-SSI-FL/
 - **Python 3.8+**
 - **Node.js 14+** and npm
 - **MIMIC-IV dataset access** — obtain credentialed access via [PhysioNet](https://physionet.org/content/mimiciv/)
-- **Ethereum wallet** — any funded account with Sepolia testnet ETH (e.g., via [MetaMask](https://metamask.io) or [Alchemy faucet](https://sepoliafaucet.com))
+- **Ethereum wallet** — not required for the local workflow below, which runs entirely against a local Hardhat node (`npx hardhat node`). Only needed if you adapt `hardhat.config.js` to deploy to a public testnet such as Sepolia (e.g., via [MetaMask](https://metamask.io) or [Alchemy faucet](https://sepoliafaucet.com))
 
 ---
 
@@ -115,23 +124,21 @@ CONTRACT_ADDRESS = '0x5FbDB2315678afecb367f032d93F642f64180aa3'
 
 ---
 
-### Step 4: Prepare the MIMIC-IV dataset
+### Step 4: Extract the MIMIC-IV cohort
 
-The repository includes a preprocessed, de-identified cohort derived from MIMIC-IV (546,028 ICU admissions):
+No dataset ships with this repository — MIMIC-IV requires credentialed PhysioNet access and its Data Use Agreement prohibits redistribution. You must extract the cohort yourself:
 
-```bash
-cd data/
-unzip mortalidade_features.csv.zip     # creates mortalidade_features.csv
-cd ..
-```
+1. Get credentialed access to MIMIC-IV v3.1 via [PhysioNet](https://physionet.org/content/mimiciv/) and load it into a local PostgreSQL instance following the official [mimic-code](https://github.com/MIT-LCP/mimic-code) build scripts.
+2. Build the community "concepts" layer (`mimic-iv/concepts_postgres`), which materializes `mimiciv_derived.charlson` (Charlson Comorbidity Index) used by the query below.
+3. Run [`sql/extract_cohort.sql`](sql/extract_cohort.sql) against your database and export the result to `data/mortalidade_features.csv` — see [`data/README.md`](data/README.md) for the exact `\copy` command.
+
+This query implements the paper's inclusion criteria (adult patients, first admission per subject, non-null `hospital_expire_flag`) and produces the `admittime` column that `src/data_loader.py` requires for a true chronological 90/10 split, plus the full clinical feature set (demographics, admission context, Charlson index, length of stay, ICD-10 sepsis/heart-failure flags) described in Sec. 4.1 of the paper.
 
 Verify extraction:
 ```bash
-python -c "import pandas as pd; df = pd.read_csv('data/mortalidade_features.csv'); print(f'{len(df)} admissions loaded')"
-# Expected: 546028 admissions loaded
+python -c "import pandas as pd; df = pd.read_csv('data/mortalidade_features.csv'); print(f'{len(df)} admissions loaded, columns: {list(df.columns)}')"
+# Expected: 546028 admissions loaded (may differ slightly depending on your MIMIC-IV build/version)
 ```
-
-**Option B — generate from raw MIMIC-IV:** If you have credentialed access to MIMIC-IV v2.2+ via a PostgreSQL instance, the cohort selection logic is embedded in `src/data_loader.py`. Run the SQL query against your MIMIC-IV database and save the result as `data/mortalidade_features.csv`.
 
 ---
 
@@ -143,15 +150,15 @@ In **Terminal 2** (with Python virtual environment activated):
 python src/main_tbfl_simulation.py
 ```
 
-**What happens at each round ($R = 100$ total):**
+**What happens at each round ($R = 100$ total, $K = 10$ honest hospitals + 5 Sybil nodes from Round 10 onward):**
 
 | Phase | Action | Component |
 |-------|--------|-----------|
-| **1. Credential issuance** | Issuer signs a Verifiable Credential (VC) for each legitimate hospital DID | Off-chain (simulated in `main_tbfl_simulation.py`) |
-| **2. On-chain registration** | Each hospital registers its DID + public key in `FLRegistry.sol` | `scripts/deploy.js` (one-time) |
-| **3. Authenticated participation** | Hospital submits VC as Verifiable Presentation → contract verifies signature → adds to authorized set $\mathcal{A}_r$ | `FLRegistry.sol`, `blockchain_manager.py` |
-| **4. Local training** | Hospital trains MLP classifier on its non-IID partition using FedProx ($\mu = 0.01$) + SMOTETomek | `cliente_fl.py` |
-| **5. Verified aggregation** | Authorized hospitals upload model hash to IPFS → submit CID signed with DID private key → aggregator retrieves only verified updates | `main_tbfl_simulation.py` |
+| **1. Credential issuance** | Issuer authorizes each of the 10 honest hospital DIDs; the 5 Sybil DIDs are never authorized | `main_tbfl_simulation.py` via `blockchain_manager.py` |
+| **2. On-chain registration** | `FLRegistry.sol` deployed once, holding the authorization registry and current-round state | `scripts/deploy.js` (one-time) |
+| **3. Authenticated participation** | Every node (honest and Sybil) calls `submitUpdate`; the contract accepts only calls from authorized addresses — Sybil calls revert | `FLRegistry.sol`, `blockchain_manager.py` |
+| **4. Local training** | Each honest hospital trains the MLP on its Dirichlet-partitioned, SMOTETomek-balanced local fold using FedProx ($\mu = 0.01$, SGD lr=0.01/momentum=0.9); Sybil nodes submit i.i.d. $\mathcal{N}(0,1)$ noise instead of training | `cliente_fl.py`, `main_tbfl_simulation.py` |
+| **5. Dual-track aggregation** | The script runs both an identity-verified ("proposed") and a no-verification ("baseline") FedAvg track from the same data/model init, so the Sybil-resistance gap is measured directly rather than assumed | `main_tbfl_simulation.py::run_simulation` |
 
 ---
 
@@ -165,33 +172,28 @@ python src/demo_security_mechanism.py
 
 The adversary:
 - Creates 5 DID identities but **lacks valid VCs** from the Trusted Issuer
-- Attempts to register in `FLRegistry.sol` — **100% rejected**
-- Simulates a label-flipping attack (minority class → majority class) — **gradients never reach aggregation**
+- Attempts to submit updates to `FLRegistry.sol` — **100% rejected** (transaction reverts)
+
+This script only demonstrates the registration/rejection mechanism in isolation. The actual accuracy-degradation comparison (baseline vs. proposed under a live Sybil noise-injection attack) is produced by running the full dual-track simulation in `main_tbfl_simulation.py`, which writes both tracks to CSV for direct comparison.
 
 **Expected result:**
 ```
 Sybil attack simulation complete:
-  - Attempted registrations: 5
-  - Blocked (no VC):         5  (100%)
-  - Model degradation:       0  (T0 vs T3: AUC-ROC gap = 14 points)
+  Attempted registrations: 5
+  Blocked (no VC):         5  (100%)
 ```
 
 ---
 
 ### Step 7: Verify results
 
-After 100 rounds, the simulation outputs final metrics to the console. Representative results:
+After 100 rounds, `main_tbfl_simulation.py` writes `tbfl_results_proposed.csv` and `tbfl_results_baseline.csv` and prints:
+- a real (not synthetic) statistical comparison of accuracy over the final 40 rounds — Welch's t-test and Cohen's d between the two tracks;
+- the cumulative on-chain gas cost and its USD conversion at 20 Gwei / \$3,000-ETH, computed from the receipts actually returned by the local Hardhat node.
 
-| Metric | T3 (SSI-FL, under attack) | T0 (no auth, under attack) |
-|--------|--------------------------|---------------------------|
-| AUC-ROC | **0.954** | 0.813 |
-| Accuracy | **88.5%** | 75.8% |
-| Recall | **0.890** | 0.700 |
-| FNR | **11.0%** | 30.0% |
-| Blockchain overhead | **< 0.12%** | — |
-| Protocol overhead (total) | **< 1%** | — |
+The exact AUC/Recall/F1 values reported in the paper (AUC=0.954, Recall=0.890, F1=0.883) were obtained on the full 25-feature, chronologically-ordered cohort described in Sec. 4.1 — reproducing them requires extracting your own cohort via `sql/extract_cohort.sql` (Step 4) rather than a reduced ad-hoc feature set. What this repository's code faithfully reproduces regardless of the exact feature set is the *qualitative* security result: the proposed (identity-verified) track keeps a stable, monotonically-improving accuracy/AUC trajectory after Round 10, while the baseline (no verification) track becomes erratic and degrades once Sybil noise updates are aggregated.
 
-The cost model $C(N,R)$ can be projected from console gas logs or the analytical formula $C(N,R) = 0.067N + 0.009NR + 0.06R$.
+For the gas/cost discrepancy between this repo's real measurements and the paper's headline "~\$18/100 rounds" figure, see "Known limitations" above.
 
 
 ## Acknowledgments

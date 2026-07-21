@@ -1,123 +1,169 @@
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.impute import SimpleImputer
+import warnings
 
-def load_and_process_mimic(file_path, num_clients):
+import numpy as np
+import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+
+
+def load_and_process_mimic(file_path, num_clients, dirichlet_alpha=0.5, seed=42):
     """
-    Loads the MIMIC-IV dataset (EHR features), performs preprocessing, 
-    and partitions the data among federated clients.
+    Loads the MIMIC-IV cohort, performs preprocessing, splits it chronologically,
+    and partitions the training fold among federated clients using a Dirichlet
+    distribution (non-IID), applying SMOTETomek independently to each client's
+    local training fold (Sec. 4.1/4.2 of the paper).
 
     Args:
         file_path (str): Path to the CSV file containing patient features.
-        num_clients (int): Number of federated clients (hospitals) to split the data into.
+                          If extracted via sql/extract_cohort.sql, it includes
+                          an 'admittime' column enabling a true chronological
+                          split. Older exports without 'admittime' fall back
+                          to a documented proxy ordering (see warning below).
+        num_clients (int): Number of federated clients (hospitals).
+        dirichlet_alpha (float): Concentration parameter for the Dirichlet
+                                  partition. Lower values -> more heterogeneous
+                                  (non-IID) client data. Paper uses alpha=0.5.
+        seed (int): Random seed for partitioning/resampling reproducibility.
 
     Returns:
-        X_train (np.array): Training features.
-        y_train (np.array): Training labels.
-        X_test (np.array): Testing features.
-        y_test (np.array): Testing labels.
-        user_groups (dict): A dictionary where keys are client IDs (0 to num_clients-1) 
-                            and values are lists of data indices belonging to that client.
+        X_train, y_train, X_test, y_test (np.ndarray): Held-out evaluation split.
+        client_data (dict): {client_id: (X_client, y_client)} — already
+                             SMOTETomek-balanced per client, ready for local training.
     """
-    print(f"📂 Loading data from: {file_path}")
-    
-    try:
-        df = pd.read_csv(file_path)
-    except FileNotFoundError:
-        # Fallback for demonstration purposes if CSV is missing
-        print("⚠️  CSV not found. Generating synthetic data for demonstration...")
-        df = generate_synthetic_mimic_data()
+    print(f"Loading data from: {file_path}")
+    df = pd.read_csv(file_path)
 
-    # 1. Define Target Variable
-    # Assuming 'hospital_expire_flag' is the target (Mortality Prediction)
-    target_col = 'hospital_expire_flag'
-    
-    # Check if target column exists, otherwise use the last column
+    target_col = "hospital_expire_flag"
     if target_col not in df.columns:
         target_col = df.columns[-1]
 
-    X = df.drop(columns=[target_col])
-    y = df[target_col]
+    # --- Chronological ordering -------------------------------------------
+    # A true chronological split requires an admission timestamp. The
+    # extraction query in sql/extract_cohort.sql produces one ('admittime').
+    # Older/reduced CSVs shipped without it (no timestamp column at all);
+    # in that case we fall back to hadm_id ordering and say so explicitly,
+    # rather than silently claiming a chronological split that isn't possible.
+    id_cols = []
+    if "admittime" in df.columns:
+        df["admittime"] = pd.to_datetime(df["admittime"])
+        df = df.sort_values("admittime").reset_index(drop=True)
+        id_cols = [c for c in ("hadm_id", "subject_id", "admittime") if c in df.columns]
+    elif "hadm_id" in df.columns:
+        warnings.warn(
+            "No 'admittime' column found — this dataset does not support a "
+            "true chronological split. Falling back to ordering by 'hadm_id' "
+            "as a proxy. Re-extract the cohort with sql/extract_cohort.sql to "
+            "obtain a genuine chronological split.",
+            stacklevel=2,
+        )
+        df = df.sort_values("hadm_id").reset_index(drop=True)
+        id_cols = ["hadm_id"]
 
-    # 2. Data Preprocessing
-    # Handle Missing Values (Imputation)
-    # Numerical: Mean | Categorical: Mode
-    num_cols = X.select_dtypes(include=[np.number]).columns
-    cat_cols = X.select_dtypes(exclude=[np.number]).columns
+    X_df = df.drop(columns=[target_col] + id_cols)
+    y = df[target_col].values
+
+    # --- Chronological 90/10 split FIRST (no shuffling: preserves temporal
+    # order), so every fitted preprocessing step below (imputer, one-hot
+    # category vocabulary, scaler) is fit on the training fold only. Fitting
+    # any of them on the full dataset would leak test-set statistics into
+    # training, e.g. mean-imputing NaNs using values seen only in the future.
+    split_idx = int(len(X_df) * 0.9)
+    X_train_df = X_df.iloc[:split_idx].copy()
+    X_test_df = X_df.iloc[split_idx:].copy()
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
+    num_cols = X_df.select_dtypes(include=[np.number]).columns
+    cat_cols = X_df.select_dtypes(exclude=[np.number]).columns
 
     if len(num_cols) > 0:
-        imputer_num = SimpleImputer(strategy='mean')
-        X[num_cols] = imputer_num.fit_transform(X[num_cols])
+        imputer_num = SimpleImputer(strategy="mean")
+        X_train_df[num_cols] = imputer_num.fit_transform(X_train_df[num_cols])
+        X_test_df[num_cols] = imputer_num.transform(X_test_df[num_cols])
 
     if len(cat_cols) > 0:
-        # One-Hot Encoding for categorical variables
-        X = pd.get_dummies(X, columns=cat_cols, drop_first=True)
+        # Fix the one-hot vocabulary to categories observed in training;
+        # unseen test-time categories fall back to the all-zero encoding
+        # (equivalent to sklearn's OneHotEncoder(handle_unknown='ignore')).
+        for col in cat_cols:
+            categories = pd.Categorical(X_train_df[col]).categories
+            X_train_df[col] = pd.Categorical(X_train_df[col], categories=categories)
+            X_test_df[col] = pd.Categorical(X_test_df[col], categories=categories)
+        X_train_df = pd.get_dummies(X_train_df, columns=list(cat_cols), drop_first=True)
+        X_test_df = pd.get_dummies(X_test_df, columns=list(cat_cols), drop_first=True)
+        X_test_df = X_test_df.reindex(columns=X_train_df.columns, fill_value=0)
 
-    # Convert to NumPy for PyTorch compatibility
-    X = X.values
-    y = y.values
+    X_train_raw = X_train_df.values.astype(np.float64)
+    X_test_raw = X_test_df.values.astype(np.float64)
+    print(f"Data processed. Feature matrix shape: train={X_train_raw.shape}, test={X_test_raw.shape}")
 
-    # Normalize/Scale Numerical Features (Critical for Neural Networks)
+    # Fit the scaler on the training fold only to avoid test-set leakage.
     scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    X_train = scaler.fit_transform(X_train_raw)
+    X_test = scaler.transform(X_test_raw)
 
-    print(f"✅ Data Processed. Shape: {X.shape}")
+    # --- Non-IID partitioning across clients (Dirichlet, alpha=0.5) ---------
+    user_groups = dirichlet_partition(y_train, num_clients, alpha=dirichlet_alpha, seed=seed)
 
-    # 3. Train/Test Split (80/20)
-    # The Test set is held out globally to evaluate the Global Model
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    # --- Per-client SMOTETomek (train folds only, applied independently) ----
+    client_data = {}
+    for client_id, idxs in user_groups.items():
+        X_c, y_c = X_train[idxs], y_train[idxs]
+        client_data[client_id] = balance_client_fold(X_c, y_c, seed=seed + client_id)
 
-    # 4. Federated Partitioning (User Groups)
-    # Distribute training data among clients.
-    # To simulate Non-IID data (as claimed in the paper), we can use a Dirichlet distribution,
-    # but for this base implementation, we use a randomized partition that ensures variety.
-    user_groups = partition_data(y_train, num_clients)
+    return X_train, y_train, X_test, y_test, client_data
 
-    return X_train, y_train, X_test, y_test, user_groups
 
-def partition_data(y_train, num_clients):
+def dirichlet_partition(y_train, num_clients, alpha=0.5, seed=42):
     """
-    Splits the training data indices among clients.
-    Currently implements an IID split for stability in the provided demo code.
-    
-    Args:
-        y_train (np.array): Labels of training data.
-        num_clients (int): Number of clients.
-        
-    Returns:
-        dict: {client_id: [index_1, index_2, ...]}
-    """
-    num_items = int(len(y_train) / num_clients)
-    dict_users, all_idxs = {}, [i for i in range(len(y_train))]
-    
-    for i in range(num_clients):
-        # Randomly select 'num_items' indices for client 'i' without replacement
-        dict_users[i] = set(np.random.choice(all_idxs, num_items, replace=False))
-        # Remove selected indices from the pool
-        all_idxs = list(set(all_idxs) - dict_users[i])
-        
-    return dict_users
+    Partitions training indices among clients using a Dirichlet distribution
+    per class, producing non-IID client data (Sec. 4.2: alpha=0.5).
 
-def generate_synthetic_mimic_data(samples=1000):
+    Lower alpha yields more skewed (heterogeneous) per-client class
+    distributions; alpha -> infinity approaches an IID split.
     """
-    Generates a synthetic dataframe mimicking MIMIC-IV structure 
-    if the real CSV is not present (facilitates reproducibility check by reviewers).
-    """
-    np.random.seed(42)
-    data = {
-        'age': np.random.randint(18, 90, samples),
-        'heart_rate': np.random.normal(80, 15, samples),
-        'sbp': np.random.normal(120, 20, samples), # Systolic Blood Pressure
-        'wbc': np.random.normal(9, 3, samples),    # White Blood Cells
-        'gender': np.random.choice([0, 1], samples),
-        'icu_los': np.random.exponential(3, samples), # Length of Stay
-        'hospital_expire_flag': np.random.choice([0, 1], samples, p=[0.85, 0.15]) # 15% Mortality rate
-    }
-    return pd.DataFrame(data)
+    rng = np.random.default_rng(seed)
+    classes = np.unique(y_train)
+    client_idxs = [[] for _ in range(num_clients)]
 
-if __name__ == "__main__":
-    # Test the loader independently
-    X_tr, y_tr, X_te, y_te, groups = load_and_process_mimic('dummy.csv', 3)
-    print(f"Test Run: {len(X_tr)} training samples distributed among 3 clients.")
+    for c in classes:
+        idx_c = np.where(y_train == c)[0]
+        rng.shuffle(idx_c)
+
+        proportions = rng.dirichlet(alpha * np.ones(num_clients))
+        split_points = (np.cumsum(proportions) * len(idx_c)).astype(int)[:-1]
+        for client_id, split in enumerate(np.split(idx_c, split_points)):
+            client_idxs[client_id].extend(split.tolist())
+
+    user_groups = {}
+    for client_id in range(num_clients):
+        idxs = np.array(client_idxs[client_id])
+        rng.shuffle(idxs)
+        user_groups[client_id] = idxs
+
+    return user_groups
+
+
+def balance_client_fold(X_client, y_client, seed=42):
+    """
+    Applies SMOTETomek exclusively to a single client's local training fold
+    (Sec. 4.1). Test/validation data must never pass through this function.
+
+    Falls back to the original (imbalanced) fold if the client has too few
+    minority-class samples for SMOTE's k-neighbors requirement — this can
+    happen for small/highly-skewed shards produced by the Dirichlet split.
+    """
+    from imblearn.combine import SMOTETomek
+
+    classes, counts = np.unique(y_client, return_counts=True)
+    if len(classes) < 2 or counts.min() < 6:
+        warnings.warn(
+            f"Skipping SMOTETomek for a client fold with class counts "
+            f"{dict(zip(classes.tolist(), counts.tolist()))}: too few minority "
+            f"samples for the default k-neighbors. Using the raw fold instead.",
+            stacklevel=2,
+        )
+        return X_client, y_client
+
+    smt = SMOTETomek(random_state=seed)
+    X_res, y_res = smt.fit_resample(X_client, y_client)
+    return X_res, y_res

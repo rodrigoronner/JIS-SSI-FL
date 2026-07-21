@@ -1,228 +1,285 @@
+import copy
+import os
+import time
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import copy
-import numpy as np
-import time
-import pandas as pd
 from scipy import stats
 from torch.utils.data import DataLoader
-from data_loader import load_and_process_mimic
-from fl_client import MLP, train_client_fedprox, MimicDataset
+
 from blockchain_manager import BlockchainManager
+from cliente_fl import MLP, MimicDataset, train_client_fedprox
+from data_loader import load_and_process_mimic
 
 # ================= CONFIGURATIONS =================
-# Address of the deployed Smart Contract on the local Hardhat network
-CONTRACT_ADDRESS = '0x5FbDB2315678afecb367f032d93F642f64180aa3' 
-CSV_PATH = 'mortality_features.csv'
+CONTRACT_ADDRESS = '0x5FbDB2315678afecb367f032d93F642f64180aa3'
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+CSV_PATH = os.path.join(_PROJECT_ROOT, 'data', 'mortalidade_features.csv')
+
+# Gas -> USD conversion assumptions used throughout the paper's cost analysis
+# (Sec. 4.4): 20 Gwei gas price, ETH at $3,000.
+GWEI_PRICE = 20
+ETH_USD = 3000
+USD_PER_GAS_UNIT = GWEI_PRICE * 1e-9 * ETH_USD
 
 ARGS = {
-    'rounds': 100,        # Number of global training rounds (Long-term simulation)
-    'num_users': 3,       # Number of participating hospitals/clients
-    'local_ep': 3,        # Local epochs per global round
-    'bs': 32,             # Batch size
-    'lr': 0.001,          # Learning rate
-    'mu': 0.01            # FedProx proximal term coefficient
+    'rounds': 100,          # R = 100 global training rounds
+    'num_honest': 10,       # K = 10 legitimate federated clients (hospitals)
+    'num_sybils': 5,        # 5 Sybil nodes -> 5/(10+5) = 33% of the network after injection
+    'attack_start_round': 10,  # Sybils join at Round 10 (1-indexed)
+    'local_ep': 3,          # E = 3 local epochs per round
+    'bs': 32,               # Batch size
+    'lr': 0.01,             # SGD learning rate
+    'momentum': 0.9,
+    'weight_decay': 1e-5,
+    'mu': 0.01,             # FedProx proximal term coefficient
+    'dirichlet_alpha': 0.5,  # Non-IID partitioning across honest clients
+    'seed': 42,
 }
 # =================================================
 
-def average_weights(w):
+
+def average_weights(state_dicts, sample_counts):
     """
-    Performs Federated Averaging (FedAvg) on the valid model weights.
-    
-    Args:
-        w (list): List of state_dicts from authorized clients.
-        
-    Returns:
-        state_dict: The averaged global model weights.
+    Performs FedAvg weighted by each contributor's local sample count
+    (Sec. 3.5: "computes a weighted average of validated updates using
+    sample counts as weights"), i.e. w_avg = sum_k (n_k / sum(n)) * w_k.
     """
-    w_avg = copy.deepcopy(w[0])
+    total = float(sum(sample_counts))
+    weights = [n / total for n in sample_counts]
+
+    w_avg = copy.deepcopy(state_dicts[0])
     for key in w_avg.keys():
-        for i in range(1, len(w)):
-            w_avg[key] += w[i][key]
-        w_avg[key] = torch.div(w_avg[key], len(w))
+        w_avg[key] = state_dicts[0][key] * weights[0]
+        for i in range(1, len(state_dicts)):
+            w_avg[key] += state_dicts[i][key] * weights[i]
     return w_avg
 
+
+def sybil_noise_update(reference_state_dict):
+    """
+    Produces a fake "model update" for a Sybil node: every tensor is sampled
+    i.i.d. from N(0, 1), matching the shapes of a legitimate update (Sec. 4.3).
+    """
+    return {k: torch.randn_like(v) for k, v in reference_state_dict.items()}
+
+
 def evaluate_model(model, X_test, y_test):
-    """
-    Evaluates the global model on the hold-out test set.
-    
-    Returns:
-        tuple: (avg_loss, accuracy, precision, recall, f1_score, auc_roc)
-    """
+    """Evaluates the global model on the held-out test set."""
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+
     model.eval()
-    criterion = nn.BCELoss() # Binary Cross Entropy
-    dataset = MimicDataset(X_test, y_test)
-    loader = DataLoader(dataset, batch_size=64, shuffle=False)
-    
-    y_true = []
-    y_pred_probs = []
-    total_loss = 0.0
-    
+    criterion = nn.BCELoss()
+    loader = DataLoader(MimicDataset(X_test, y_test), batch_size=64, shuffle=False)
+
+    y_true, y_pred_probs, total_loss = [], [], 0.0
     with torch.no_grad():
         for inputs, labels in loader:
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item()
-            
+            total_loss += criterion(outputs, labels).item()
             y_pred_probs.extend(outputs.numpy())
             y_true.extend(labels.numpy())
-            
-    # Calculate averages
+
     avg_loss = total_loss / len(loader)
     y_true = np.array(y_true)
     y_pred_probs = np.array(y_pred_probs)
     y_pred_cls = (y_pred_probs > 0.5).astype(int)
-    
-    # Scikit-Learn Metrics
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+
     acc = accuracy_score(y_true, y_pred_cls)
     prec = precision_score(y_true, y_pred_cls, zero_division=0)
     rec = recall_score(y_true, y_pred_cls, zero_division=0)
     f1 = f1_score(y_true, y_pred_cls, zero_division=0)
     try:
         auc_val = roc_auc_score(y_true, y_pred_probs)
-    except:
-        auc_val = 0.5 # Fallback if only one class is present
-        
+    except ValueError:
+        auc_val = 0.5
+
     return avg_loss, acc, prec, rec, f1, auc_val
 
-def analyze_statistics(df_history):
+
+def run_simulation(track_name, enforce_identity, bc, honest_workers, sybil_workers,
+                    client_data, X_test, y_test, input_dim, args):
     """
-    Performs automated statistical analysis:
-    1. Stabilization Point Detection (Moving Standard Deviation).
-    2. T-Test comparing TBFL performance against a Theoretical Attack Baseline.
+    Runs one full R-round federated simulation.
+
+    enforce_identity=True  -> "proposed" system: every submission goes through
+        FLRegistry.submitUpdate(); only credentialed honest workers succeed,
+        Sybil submissions revert and are excluded from aggregation.
+    enforce_identity=False -> "baseline" system: standard FedAvg with no
+        on-chain gate at all; Sybil noise updates (from attack_start_round
+        onward) are aggregated alongside honest updates, exactly like a
+        deployment that never added identity verification.
     """
-    print("\n📊 --- AUTOMATED STATISTICAL ANALYSIS ---")
-    
-    acc_series = df_history['accuracy'].values
-    rounds = df_history['round'].values
-    
-    # 1. Stabilization Point Detection
-    # Identifies where the moving standard deviation (window=5) drops below 0.002
-    window = 5
-    stabilization_point = ARGS['rounds'] # Default: did not stabilize
-    rolling_std = pd.Series(acc_series).rolling(window=window).std()
-    
-    stable_indices = np.where(rolling_std < 0.002)[0]
-    if len(stable_indices) > 0:
-        stabilization_point = stable_indices[0]
-    
-    print(f"🔹 Estimated Stabilization Point: Round {stabilization_point}")
-    
-    # 2. T-Test (TBFL Real vs Theoretical Attack Baseline)
-    # Since we are not running the full attack in this script (to save time), 
-    # We construct a theoretical baseline based on literature: Sybil attacks degrade models by ~20%.
-    
-    # Get last 20 rounds (stable phase)
-    tbfl_stable = acc_series[-20:]
-    
-    # Simulate baseline: TBFL Accuracy * 0.8 (20% degradation) + Gaussian Noise
-    np.random.seed(42)
-    baseline_stable = (tbfl_stable * 0.8) + np.random.normal(0, 0.05, size=20)
-    
-    t_stat, p_val = stats.ttest_ind(tbfl_stable, baseline_stable, alternative='greater')
-    
-    print(f"🔹 Security Comparison (TBFL vs Attack Baseline):")
-    print(f"   TBFL Mean (Last 20 rounds): {np.mean(tbfl_stable):.4f}")
-    print(f"   Baseline Mean (Estimated):  {np.mean(baseline_stable):.4f}")
-    print(f"   T-Statistic: {t_stat:.4f}")
-    print(f"   P-Value:     {p_val:.2e}")
-    
-    if p_val < 0.001:
-        print("✅ Result: STATISTICALLY SIGNIFICANT difference (p < 0.001).")
-    else:
-        print("⚠️ Result: No significant difference.")
-
-    return stabilization_point, p_val
-
-def main():
-    print(f"🚀 Starting Real TBFL Simulation ({ARGS['rounds']} Rounds)...")
-    
-    # 1. Initialize Blockchain Manager
-    try:
-        bc = BlockchainManager(CONTRACT_ADDRESS)
-    except Exception as e:
-        print(f"Blockchain Error: {e}")
-        return
-
-    # 2. Load Data
-    X_train, y_train, X_test, y_test, user_groups = load_and_process_mimic(CSV_PATH, ARGS['num_users'])
-    dataset_train = MimicDataset(X_train, y_train)
-    
-    # 3. Initialize Global Model
-    input_dim = X_train.shape[1]
+    torch.manual_seed(args['seed'])
     global_model = MLP(input_dim)
     global_model.train()
-    global_weights = global_model.state_dict()
 
-    # 4. Identity Management (Simulation)
-    # Only 2 out of 3 workers receive valid credentials to simulate access control
-    workers = [bc.get_account(1), bc.get_account(2), bc.get_account(3)]
-    bc.issue_credential(workers[0]) 
-    bc.issue_credential(workers[1]) 
-    # Worker 3 is NOT authorized (Simulating a Sybil/Unauthorized node)
-    
+    # Sample counts used as FedAvg weights (Sec. 3.5). Honest clients weigh
+    # by the size of their local (post-SMOTETomek) training fold. A Sybil
+    # node has no genuine dataset; we assume it claims a size equal to the
+    # mean honest client, i.e. a plausible-looking institution rather than
+    # a trivially detectable outlier — this is a modeling assumption, not
+    # something the paper specifies explicitly.
+    honest_sample_counts = {cid: len(client_data[cid][0]) for cid in range(len(honest_workers))}
+    sybil_claimed_count = int(np.mean(list(honest_sample_counts.values())))
+
     history = []
+    cumulative_gas = 0
 
-    # 5. FL Training Loop
-    for round_idx in range(ARGS['rounds']):
-        
-        local_weights = []
-        blockchain_times = []
-        training_times = []
-        
-        # Iterate over clients
-        for idx in range(ARGS['num_users']):
-            worker_addr = workers[idx]
-            
-            # Local Training
+    for round_idx in range(1, args['rounds'] + 1):
+        accepted_weights, accepted_counts = [], []
+        training_times, blockchain_times = [], []
+        attack_active = round_idx >= args['attack_start_round']
+
+        # --- Honest clients: real local training on their Dirichlet/SMOTETomek fold ---
+        for cid, worker_addr in enumerate(honest_workers):
+            X_c, y_c = client_data[cid]
             t0 = time.time()
-            w, _ = train_client_fedprox(copy.deepcopy(global_model), dataset_train, user_groups[idx], ARGS, global_model)
+            w, _ = train_client_fedprox(
+                copy.deepcopy(global_model), X_c, y_c, args, global_model
+            )
             training_times.append(time.time() - t0)
-            
-            # Blockchain Verification
-            t0_bc = time.time()
-            # Simulate IPFS Hash (in production, this would be a real CID)
-            fake_ipfs = f"QmHash_{round_idx}_{worker_addr[:5]}"
-            
-            # Attempt to submit to Smart Contract
-            accepted, _ = bc.submit_hash(worker_addr, fake_ipfs)
-            blockchain_times.append(time.time() - t0_bc)
-            
-            # Aggregation Logic: Only include weights if Blockchain accepted the submission
-            if accepted:
-                local_weights.append(copy.deepcopy(w))
-        
-        # Global Aggregation
-        if len(local_weights) > 0:
-            global_weights = average_weights(local_weights)
-            global_model.load_state_dict(global_weights)
-            
-            # Evaluation
-            loss, acc, prec, rec, f1, auc_val = evaluate_model(global_model, X_test, y_test)
-            
-            if (round_idx + 1) % 10 == 0:
-                print(f"\n   📅 R{round_idx+1}: Loss={loss:.4f} | Acc={acc:.4f} | AUC={auc_val:.4f}")
 
-            history.append({
-                'round': round_idx + 1,
-                'loss': loss,
-                'accuracy': acc,
-                'precision': prec,
-                'recall': rec,
-                'f1': f1,
-                'auc': auc_val,
-                'avg_train_time': np.mean(training_times),
-                'avg_blockchain_time': np.mean(blockchain_times)
-            })
-            
-    # Save Results
-    df_res = pd.DataFrame(history)
-    df_res.to_csv('tbfl_simulation_results.csv', index=False)
-    print("\n✅ Simulation complete. Results saved to CSV.")
-    
-    # Statistical Analysis
-    analyze_statistics(df_res)
+            if enforce_identity:
+                t0_bc = time.time()
+                fake_cid = f"Qm{round_idx}_{worker_addr[:8]}"
+                ok, gas_used = bc.submit_hash(worker_addr, fake_cid)
+                blockchain_times.append(time.time() - t0_bc)
+                cumulative_gas += gas_used
+                if ok:
+                    accepted_weights.append(w)
+                    accepted_counts.append(honest_sample_counts[cid])
+            else:
+                accepted_weights.append(w)
+                accepted_counts.append(honest_sample_counts[cid])
+
+        # --- Sybil nodes: random-noise updates injected from attack_start_round ---
+        if attack_active:
+            for worker_addr in sybil_workers:
+                noisy_update = sybil_noise_update(global_model.state_dict())
+                if enforce_identity:
+                    fake_cid = f"Qm{round_idx}_sybil_{worker_addr[:8]}"
+                    ok, gas_used = bc.submit_hash(worker_addr, fake_cid)
+                    cumulative_gas += gas_used  # 0 for reverted calls in blockchain_manager
+                    if ok:
+                        accepted_weights.append(noisy_update)  # never happens: no VC
+                        accepted_counts.append(sybil_claimed_count)
+                else:
+                    accepted_weights.append(noisy_update)
+                    accepted_counts.append(sybil_claimed_count)
+
+        if not accepted_weights:
+            continue
+
+        global_weights = average_weights(accepted_weights, accepted_counts)
+        global_model.load_state_dict(global_weights)
+
+        loss, acc, prec, rec, f1, auc_val = evaluate_model(global_model, X_test, y_test)
+
+        if round_idx % 10 == 0:
+            print(f"  [{track_name}] R{round_idx}: Loss={loss:.4f} Acc={acc:.4f} "
+                  f"AUC={auc_val:.4f} Recall={rec:.4f}")
+
+        history.append({
+            'round': round_idx,
+            'loss': loss,
+            'accuracy': acc,
+            'precision': prec,
+            'recall': rec,
+            'f1': f1,
+            'auc': auc_val,
+            'avg_train_time': np.mean(training_times) if training_times else np.nan,
+            'avg_blockchain_time': np.mean(blockchain_times) if blockchain_times else np.nan,
+            'cumulative_gas': cumulative_gas,
+            'cumulative_cost_usd': cumulative_gas * USD_PER_GAS_UNIT,
+        })
+
+    return pd.DataFrame(history)
+
+
+def compare_tracks(df_proposed, df_baseline, last_n_rounds=40):
+    """
+    Statistical comparison of the two tracks' accuracy over the final
+    `last_n_rounds` rounds (Sec. 5.2 reports this over the final 40 rounds).
+    Both series come from real simulation runs — no synthetic baseline.
+    """
+    print("\n--- STATISTICAL ANALYSIS (real baseline vs. real proposed run) ---")
+
+    acc_proposed = df_proposed['accuracy'].values[-last_n_rounds:]
+    acc_baseline = df_baseline['accuracy'].values[-last_n_rounds:]
+
+    t_stat, p_val = stats.ttest_ind(acc_proposed, acc_baseline, equal_var=False)
+
+    n1, n2 = len(acc_proposed), len(acc_baseline)
+    pooled_std = np.sqrt(
+        ((n1 - 1) * acc_proposed.std(ddof=1) ** 2 + (n2 - 1) * acc_baseline.std(ddof=1) ** 2)
+        / (n1 + n2 - 2)
+    )
+    cohens_d = (acc_proposed.mean() - acc_baseline.mean()) / pooled_std if pooled_std > 0 else np.nan
+
+    print(f"  Proposed mean accuracy (last {last_n_rounds} rounds): {acc_proposed.mean():.4f}")
+    print(f"  Baseline mean accuracy (last {last_n_rounds} rounds): {acc_baseline.mean():.4f}")
+    print(f"  t = {t_stat:.4f}, p = {p_val:.3e}, Cohen's d = {cohens_d:.4f}")
+
+    return t_stat, p_val, cohens_d
+
+
+def main():
+    print(f"Starting TBFL simulation ({ARGS['rounds']} rounds, "
+          f"{ARGS['num_honest']} honest + {ARGS['num_sybils']} Sybil nodes)...")
+
+    bc = BlockchainManager(CONTRACT_ADDRESS)
+
+    total_workers_needed = 1 + ARGS['num_honest'] + ARGS['num_sybils']
+    if len(bc.accounts) < total_workers_needed:
+        raise RuntimeError(
+            f"Need {total_workers_needed} funded accounts (1 issuer + "
+            f"{ARGS['num_honest']} honest + {ARGS['num_sybils']} Sybil), "
+            f"but the connected node only exposes {len(bc.accounts)}."
+        )
+
+    honest_workers = [bc.get_account(i) for i in range(1, ARGS['num_honest'] + 1)]
+    sybil_workers = [
+        bc.get_account(i)
+        for i in range(ARGS['num_honest'] + 1, ARGS['num_honest'] + ARGS['num_sybils'] + 1)
+    ]
+
+    print("\nOnboarding: issuing credentials to honest hospitals only.")
+    for worker in honest_workers:
+        bc.issue_credential(worker)
+    print(f"{len(sybil_workers)} Sybil nodes were NOT issued credentials.")
+
+    X_train, y_train, X_test, y_test, client_data = load_and_process_mimic(
+        CSV_PATH, ARGS['num_honest'], dirichlet_alpha=ARGS['dirichlet_alpha'], seed=ARGS['seed']
+    )
+    input_dim = X_train.shape[1]
+
+    print("\n=== Track 1/2: PROPOSED (identity-verified) ===")
+    df_proposed = run_simulation(
+        'proposed', True, bc, honest_workers, sybil_workers,
+        client_data, X_test, y_test, input_dim, ARGS
+    )
+
+    print("\n=== Track 2/2: BASELINE (standard FedAvg, no identity verification) ===")
+    df_baseline = run_simulation(
+        'baseline', False, bc, honest_workers, sybil_workers,
+        client_data, X_test, y_test, input_dim, ARGS
+    )
+
+    df_proposed.to_csv('tbfl_results_proposed.csv', index=False)
+    df_baseline.to_csv('tbfl_results_baseline.csv', index=False)
+    print("\nResults saved to tbfl_results_proposed.csv / tbfl_results_baseline.csv")
+
+    compare_tracks(df_proposed, df_baseline, last_n_rounds=40)
+
+    total_cost = df_proposed['cumulative_cost_usd'].iloc[-1]
+    print(f"\nTotal on-chain cost over {ARGS['rounds']} rounds (proposed system): "
+          f"${total_cost:.2f} (20 Gwei, ETH=${ETH_USD})")
+
 
 if __name__ == '__main__':
     main()

@@ -1,119 +1,91 @@
-import torch
-import pandas as pd
 import json
 import os
+
 from web3 import Web3
 
 """
 demo_security_mechanism.py
 
-This script provides a standalone Proof of Concept (PoC) demonstrating the 
-Identity-First security mechanism proposed in the TBFL framework.
-
-It simulates:
-1. A legitimate node (Hospital A) receiving a Verifiable Credential.
-2. An illegitimate node (Attacker) attempting to submit updates without a credential.
-3. The Smart Contract enforcing access control.
+Standalone Proof of Concept demonstrating the Identity-First security
+mechanism: 2 legitimate hospitals receive Verifiable Credentials, while a
+Sybil adversary controlling 5 unauthorized identities (Sec. 4.3: 5 Sybil
+nodes) attempts to submit random-noise model updates. The smart contract
+rejects every Sybil submission because none of the 5 addresses were ever
+authorized by the Trusted Issuer.
 """
 
 # ================= CONFIGURATION =================
 RPC_URL = 'http://127.0.0.1:8545'
-# NOTE: Update this address after running 'npx hardhat run scripts/deploy.js'
-CONTRACT_ADDRESS = '0x5FbDB2315678afecb367f032d93F642f64180aa3' 
+CONTRACT_ADDRESS = '0x5FbDB2315678afecb367f032d93F642f64180aa3'
+NUM_SYBILS = 5
 # =================================================
 
+
 def load_contract_abi():
-    """Helper to load the ABI from the Hardhat artifacts folder."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    artifact_path = os.path.join(script_dir, 'artifacts', 'contracts', 'FLRegistry.sol', 'FLRegistry.json')
-    
+    project_root = os.path.dirname(script_dir)
+    artifact_path = os.path.join(
+        project_root, 'artifacts', 'contracts', 'FLRegistry.sol', 'FLRegistry.json'
+    )
     if not os.path.exists(artifact_path):
-        raise FileNotFoundError(f"❌ ABI Artifact not found at {artifact_path}. Did you compile the contracts?")
-        
+        raise FileNotFoundError(
+            f"ABI artifact not found at {artifact_path}. Run 'npx hardhat compile' first."
+        )
     with open(artifact_path) as f:
         return json.load(f)['abi']
 
+
+def attempt_submission(w3, contract, worker_account, label):
+    """Simulates a noise-based Sybil submission attempt against the contract."""
+    fake_ipfs_hash = f"QmSybilNoise_{worker_account[:8]}"
+    try:
+        tx = contract.functions.submitUpdate(fake_ipfs_hash).transact({'from': worker_account})
+        receipt = w3.eth.wait_for_transaction_receipt(tx)
+        print(f"  [{label}] SUCCESS: accepted in block {receipt['blockNumber']} "
+              f"(gas={receipt['gasUsed']}).")
+        return True
+    except Exception:
+        print(f"  [{label}] BLOCKED: transaction reverted (Access Denied: No Valid VC).")
+        return False
+
+
 def main():
-    # 1. Connection to Local Blockchain (Hardhat Node)
-    try:
-        w3 = Web3(Web3.HTTPProvider(RPC_URL))
-        if not w3.is_connected():
-            raise Exception("Node not connected")
-    except Exception as e:
-        print(f"❌ Failed to connect to Blockchain: {e}")
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    if not w3.is_connected():
+        print("Failed to connect to blockchain. Ensure 'npx hardhat node' is running.")
         return
 
-    # Load Contract
-    try:
-        abi = load_contract_abi()
-        contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=abi)
-        print(f"🔗 Connected to Smart Contract at {CONTRACT_ADDRESS}")
-    except Exception as e:
-        print(f"❌ Contract Error: {e}")
-        return
+    abi = load_contract_abi()
+    contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=abi)
+    print(f"Connected to FLRegistry at {CONTRACT_ADDRESS}")
 
-    # 2. Identity Simulation (DIDs)
-    # Hardhat provides pre-funded accounts. We assign roles:
-    issuer = w3.eth.accounts[0]     # Trusted Issuer (e.g., Ministry of Health)
-    hospital_A = w3.eth.accounts[1] # Legitimate Participant
-    hospital_B = w3.eth.accounts[2] # Legitimate Participant
-    attacker = w3.eth.accounts[3]   # Malicious Node (No VC issued)
+    issuer = w3.eth.accounts[0]
+    hospital_a = w3.eth.accounts[1]
+    hospital_b = w3.eth.accounts[2]
+    sybil_accounts = w3.eth.accounts[3:3 + NUM_SYBILS]
 
-    print("\n--- 🏛️  PHASE 1: Credential Issuance (Onboarding) ---")
-    
-    # The Issuer authorizes legitimate hospitals on-chain (Simulating VC issuance)
-    print(f"🔹 Issuer authorizing Hospital A ({hospital_A[:6]}...)...")
-    tx_hash = contract.functions.authorizeWorker(hospital_A).transact({'from': issuer})
-    w3.eth.wait_for_transaction_receipt(tx_hash)
-    print("   ✅ Authorization Confirmed.")
+    print("\n--- PHASE 1: Credential Issuance (legitimate hospitals only) ---")
+    for label, addr in [("Hospital A", hospital_a), ("Hospital B", hospital_b)]:
+        tx_hash = contract.functions.authorizeWorker(addr).transact({'from': issuer})
+        w3.eth.wait_for_transaction_receipt(tx_hash)
+        print(f"  Issuer authorized {label} ({addr[:8]}...).")
 
-    print(f"🔹 Issuer authorizing Hospital B ({hospital_B[:6]}...)...")
-    tx_hash = contract.functions.authorizeWorker(hospital_B).transact({'from': issuer})
-    w3.eth.wait_for_transaction_receipt(tx_hash)
-    print("   ✅ Authorization Confirmed.")
-    
-    print(f"⚠️  Attacker ({attacker[:6]}...) is NOT authorized.")
+    print(f"\n{len(sybil_accounts)} Sybil identities were NOT issued credentials.")
 
-    # 3. Data Loading (Placeholder)
-    # In a real scenario, this would load the MIMIC-IV dataset
-    # data = pd.read_csv('./data/mimic_iv_processed.csv')
-    print("\n--- 🏥 PHASE 2: Local Training & Submission ---")
+    print("\n--- PHASE 2: Submission attempts ---")
+    attempt_submission(w3, contract, hospital_a, "Hospital A (legit)")
+    attempt_submission(w3, contract, hospital_b, "Hospital B (legit)")
 
-    # 4. Simulation Function
-    def simulate_training_and_submission(worker_account, label):
-        print(f"\n🔄 [{label}] Starting local training...")
-        
-        # ... Standard PyTorch training logic would go here ...
-        # ... net.train() ...
-        
-        # Simulate the generation of a Model Update Hash (IPFS CID)
-        # In practice, this hash points to the weights stored off-chain
-        model_weights_hash = f"QmHashIPFS_Simulated_{worker_account[:5]}_{label}"
-        
-        print(f"   Generated Model Hash: {model_weights_hash}")
-        print(f"   Attempting to submit hash to Blockchain...")
-        
-        # 5. Blockchain Submission Attempt
-        try:
-            # The Smart Contract checks: require(authorized[msg.sender], "Access Denied");
-            tx = contract.functions.submitUpdate(model_weights_hash).transact({'from': worker_account})
-            receipt = w3.eth.wait_for_transaction_receipt(tx)
-            
-            print(f"   ✅ SUCCESS: Update accepted in block {receipt['blockNumber']}.")
-            print(f"   Gas Used: {receipt['gasUsed']}")
-            
-        except Exception as e:
-            # If the node is not authorized, the transaction reverts
-            print(f"   ⛔ BLOCKED: Transaction reverted by Smart Contract.")
-            print(f"   Reason: Access Denied / Caller is not authorized.")
+    blocked = 0
+    for i, sybil_addr in enumerate(sybil_accounts):
+        accepted = attempt_submission(w3, contract, sybil_addr, f"Sybil #{i + 1}")
+        blocked += (not accepted)
 
-    # EXECUTE SCENARIOS
-    
-    # Scenario A: Legitimate Hospital
-    simulate_training_and_submission(hospital_A, "Hospital A (Legit)")
-    
-    # Scenario B: Sybil Attacker
-    simulate_training_and_submission(attacker, "Sybil Attacker")
+    print("\nSybil attack simulation complete:")
+    print(f"  Attempted registrations: {len(sybil_accounts)}")
+    print(f"  Blocked (no VC):         {blocked} "
+          f"({100 * blocked / len(sybil_accounts):.0f}%)")
+
 
 if __name__ == "__main__":
     main()

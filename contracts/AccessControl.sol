@@ -3,7 +3,10 @@ pragma solidity ^0.8.0;
 
 /**
  * @title AccessControl
- * @dev Manages identity verification for Federated Learning participants via VCs.
+ * @dev DEPRECATED / UNUSED: superseded by FLRegistry.sol, which is the
+ * contract actually deployed by scripts/deploy.js and used throughout the
+ * simulation. This file is an earlier draft kept only for reference and
+ * is safe to delete.
  */
 contract AccessControl {
     address public issuer;
