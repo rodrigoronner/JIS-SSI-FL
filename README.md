@@ -16,7 +16,7 @@ This repository implements a decentralized identity verification protocol for Fe
 - **100% external Sybil attack neutralization**: Only DIDs with valid Verifiable Credentials can participate
 - **Domain-agnostic protocol**: Transferable beyond healthcare to any Internet service requiring authenticated collaborative ML
 - **Non-IID federation**: 10 hospital clients partitioned via a Dirichlet distribution (alpha=0.5), each fold independently rebalanced with SMOTETomek
-- **Dual-track evaluation**: every run produces both a "proposed" (identity-verified) and a "baseline" (standard FedAvg, no verification) trajectory from a real simulation — not a synthetic baseline — so the Sybil-resistance claim is directly measurable
+- **Four-track evaluation**: every run compares `proposed` (on-chain identity verification), `pki` (equivalent off-chain allowlist, no blockchain), `reputation` (reactive trust-score defense, the class critiqued as prior art), and `baseline` (no defense) — all from real simulation runs, not synthetic baselines, so both the Sybil-resistance claim and what specifically blockchain contributes on top of "identity-first" are directly measurable
 - **< 1% protocol overhead**: blockchain verification adds negligible latency relative to local training
 - **LGPD compliance mapping**: First structured analysis of Brazilian data protection law across FL trust models
 
@@ -156,7 +156,18 @@ python src/main_tbfl_simulation.py
 | **2. On-chain registration** | `FLRegistry.sol` deployed once, holding the authorization registry and current-round state | `scripts/deploy.js` (one-time) |
 | **3. Authenticated participation** | Every node (honest and Sybil) calls `submitUpdate`; the contract accepts only calls from authorized addresses — Sybil calls revert | `FLRegistry.sol`, `blockchain_manager.py` |
 | **4. Local training** | Each honest hospital trains the MLP on its Dirichlet-partitioned, SMOTETomek-balanced local fold using FedProx ($\mu = 0.01$, SGD lr=0.01/momentum=0.9); Sybil nodes submit i.i.d. $\mathcal{N}(0,1)$ noise instead of training | `cliente_fl.py`, `main_tbfl_simulation.py` |
-| **5. Dual-track aggregation** | The script runs both an identity-verified ("proposed") and a no-verification ("baseline") FedAvg track from the same data/model init, so the Sybil-resistance gap is measured directly rather than assumed | `main_tbfl_simulation.py::run_simulation` |
+| **5. Four-track aggregation** | The script runs `proposed`, `pki`, `reputation`, and `baseline` from the same data/model init (see below), so the Sybil-resistance gap — and what specifically blockchain adds versus a simpler identity check — is measured directly rather than assumed | `main_tbfl_simulation.py::run_simulation` |
+
+**The four tracks**, all evaluated under the identical attack (5 Sybil nodes join at Round 10):
+
+| Track | Identity check | Enforcement | Expected behavior |
+|-------|-----------------|-------------|--------------------|
+| `proposed` | Yes (VC-gated) | On-chain (`FLRegistry.sol`) | Sybils rejected before any computation reaches aggregation — zero degradation |
+| `pki` | Yes (VC-gated) | Off-chain, in-memory allowlist | **Identical** trajectory to `proposed` — isolates that Sybil-resistance comes from checking identity first, not from the ledger itself; blockchain's contribution is auditability/decentralization (Sec. 6.1), not raw Sybil defense |
+| `reputation` | No — any node may submit | Reactive trust score (cosine similarity to the round's median update; cold-start neutral, asymmetric reward/penalty) | Sybils are included for the first 1-2 rounds after joining (a real degradation "window of vulnerability") before trust drops below the participation threshold and they are excluded |
+| `baseline` | No | None | Sybils are aggregated every round indefinitely; the reference worst case |
+
+The `reputation` track is a reference implementation of the class of defenses critiqued in Sec. 2.1 (trust accumulated from historical contribution quality) — it is not a reproduction of any specific named system (e.g. FoolsGold, Krum), and its thresholds (`reputation_*` in `ARGS`) are simple, documented choices rather than a tuned/optimal design.
 
 ---
 
@@ -185,11 +196,12 @@ Sybil attack simulation complete:
 
 ### Step 7: Verify results
 
-After 100 rounds, `main_tbfl_simulation.py` writes `tbfl_results_proposed.csv` and `tbfl_results_baseline.csv` and prints:
-- a real (not synthetic) statistical comparison of accuracy over the final 40 rounds — Welch's t-test and Cohen's d between the two tracks;
-- the cumulative on-chain gas cost and its USD conversion at 20 Gwei / \$3,000-ETH, computed from the receipts actually returned by the local Hardhat node.
+After 100 rounds, `main_tbfl_simulation.py` writes one CSV per track (`tbfl_results_proposed.csv`, `tbfl_results_pki.csv`, `tbfl_results_reputation.csv`, `tbfl_results_baseline.csv`) and prints:
+- pairwise statistical comparisons of accuracy over the final 40 rounds (Welch's t-test and Cohen's d) between `proposed` and each of the other three tracks;
+- the **window of vulnerability** for each track — how many rounds after Round 10 the AUC stays degraded before durably recovering (0 for `proposed`/`pki`, a small positive number for `reputation`, and typically "never recovers" for `baseline`);
+- the cumulative on-chain gas cost and its USD conversion at 20 Gwei / \$3,000-ETH, computed from the receipts actually returned by the local Hardhat node (only the `proposed` track touches the blockchain; `pki` and `reputation` are deliberately off-chain).
 
-The exact AUC/Recall/F1 values reported in the paper (AUC=0.954, Recall=0.890, F1=0.883) were obtained on the full 25-feature, chronologically-ordered cohort described in Sec. 4.1 — reproducing them requires extracting your own cohort via `sql/extract_cohort.sql` (Step 4) rather than a reduced ad-hoc feature set. What this repository's code faithfully reproduces regardless of the exact feature set is the *qualitative* security result: the proposed (identity-verified) track keeps a stable, monotonically-improving accuracy/AUC trajectory after Round 10, while the baseline (no verification) track becomes erratic and degrades once Sybil noise updates are aggregated.
+The exact AUC/Recall/F1 values reported in the paper (AUC=0.954, Recall=0.890, F1=0.883) were obtained on the full 25-feature, chronologically-ordered cohort described in Sec. 4.1 — reproducing them requires extracting your own cohort via `sql/extract_cohort.sql` (Step 4) rather than a reduced ad-hoc feature set. What this repository's code faithfully reproduces regardless of the exact feature set is the *qualitative* security result: `proposed` and `pki` keep a stable, monotonically-improving accuracy/AUC trajectory after Round 10 with zero window of vulnerability; `reputation` dips briefly then recovers once trust drops below threshold; `baseline` degrades and never recovers.
 
 ## Acknowledgments
 

@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy import stats
 from torch.utils.data import DataLoader
 
@@ -39,8 +40,23 @@ ARGS = {
     'mu': 0.01,             # FedProx proximal term coefficient
     'dirichlet_alpha': 0.5,  # Non-IID partitioning across honest clients
     'seed': 42,
+    # Reputation-based baseline (Sec. 2.1's critiqued class of defenses):
+    # a reference implementation using cosine-similarity-to-median as the
+    # trust signal, NOT a reproduction of any specific named system
+    # (e.g. FoolsGold, Krum) — it exists to demonstrate the *reactive,
+    # detection-lag* property common to this class, not to claim it is the
+    # strongest possible reputation defense.
+    'reputation_participation_threshold': 0.5,   # trust >= this to be aggregated
+    'reputation_similarity_threshold': 0.5,      # cosine sim >= this counts as "good"
+    'reputation_reward': 0.1,                    # trust gained per good round
+    'reputation_penalty': 0.3,                   # trust lost per bad round (asymmetric: slow to build, fast to lose)
 }
 # =================================================
+
+
+def flatten_state_dict(state_dict):
+    """Flattens a model state_dict into a single 1-D tensor for similarity comparisons."""
+    return torch.cat([v.flatten() for v in state_dict.values()])
 
 
 def average_weights(state_dicts, sample_counts):
@@ -101,41 +117,55 @@ def evaluate_model(model, X_test, y_test):
     return avg_loss, acc, prec, rec, f1, auc_val
 
 
-def run_simulation(track_name, enforce_identity, bc, honest_workers, sybil_workers,
+def run_simulation(track_name, mode, bc, honest_workers, sybil_workers,
                     client_data, X_test, y_test, input_dim, args):
     """
-    Runs one full R-round federated simulation.
+    Runs one full R-round federated simulation under one of four gating modes:
 
-    enforce_identity=True  -> "proposed" system: every submission goes through
-        FLRegistry.submitUpdate(); only credentialed honest workers succeed,
-        Sybil submissions revert and are excluded from aggregation.
-    enforce_identity=False -> "baseline" system: standard FedAvg with no
-        on-chain gate at all; Sybil noise updates (from attack_start_round
-        onward) are aggregated alongside honest updates, exactly like a
-        deployment that never added identity verification.
+    mode='proposed'   -> identity-first, on-chain: every submission goes
+        through FLRegistry.submitUpdate(); only credentialed honest workers
+        succeed, Sybil submissions revert and are excluded from aggregation.
+        Real gas cost is measured.
+    mode='pki'        -> identity-first, off-chain: the SAME deterministic
+        allowlist semantics as 'proposed', but enforced with a plain
+        in-memory set instead of a smart contract. Exists to isolate what
+        blockchain specifically adds on top of "identity-first" as a
+        paradigm (Sec. 3.1/6.1): if 'pki' and 'proposed' produce identical
+        security trajectories, the Sybil-resistance comes from checking
+        identity before aggregation, not from the ledger itself.
+    mode='reputation' -> the class of defense critiqued in Sec. 2.1: no
+        identity check at all; every node may submit, and a trust score
+        accumulated from historical update similarity gates future
+        participation. Cold-start neutral (all nodes start fully trusted),
+        reactive (a node is only excluded after enough bad rounds are
+        observed), unlike identity-first's preemptive exclusion.
+    mode='baseline'   -> standard FedAvg, no defense of any kind.
     """
     torch.manual_seed(args['seed'])
     global_model = MLP(input_dim)
     global_model.train()
 
-    # Sample counts used as FedAvg weights (Sec. 3.5). Honest clients weigh
-    # by the size of their local (post-SMOTETomek) training fold. A Sybil
-    # node has no genuine dataset; we assume it claims a size equal to the
-    # mean honest client, i.e. a plausible-looking institution rather than
-    # a trivially detectable outlier — this is a modeling assumption, not
-    # something the paper specifies explicitly.
     honest_sample_counts = {cid: len(client_data[cid][0]) for cid in range(len(honest_workers))}
     sybil_claimed_count = int(np.mean(list(honest_sample_counts.values())))
+
+    # Static allowlist for the 'pki' mode (no blockchain involved at all).
+    pki_authorized = set(honest_workers)
+
+    # Trust scores for the 'reputation' mode: every node starts fully
+    # trusted (cold-start neutrality — matches the literature's description
+    # of open FL deployments where "any node presenting a valid network
+    # address and key pair may request participation", Sec. 2.1).
+    trust_scores = {addr: 1.0 for addr in list(honest_workers) + list(sybil_workers)}
 
     history = []
     cumulative_gas = 0
 
     for round_idx in range(1, args['rounds'] + 1):
-        accepted_weights, accepted_counts = [], []
         training_times, blockchain_times = [], []
         attack_active = round_idx >= args['attack_start_round']
 
-        # --- Honest clients: real local training on their Dirichlet/SMOTETomek fold ---
+        # --- Honest clients always train locally, regardless of mode ---
+        honest_updates = {}
         for cid, worker_addr in enumerate(honest_workers):
             X_c, y_c = client_data[cid]
             t0 = time.time()
@@ -143,34 +173,80 @@ def run_simulation(track_name, enforce_identity, bc, honest_workers, sybil_worke
                 copy.deepcopy(global_model), X_c, y_c, args, global_model
             )
             training_times.append(time.time() - t0)
+            honest_updates[worker_addr] = w
 
-            if enforce_identity:
+        # --- Sybil nodes submit N(0,1) noise once the attack is active ---
+        sybil_updates = {}
+        if attack_active:
+            for worker_addr in sybil_workers:
+                sybil_updates[worker_addr] = sybil_noise_update(global_model.state_dict())
+
+        accepted_weights, accepted_counts = [], []
+
+        if mode == 'proposed':
+            for cid, worker_addr in enumerate(honest_workers):
                 t0_bc = time.time()
                 fake_cid = f"Qm{round_idx}_{worker_addr[:8]}"
                 ok, gas_used = bc.submit_hash(worker_addr, fake_cid)
                 blockchain_times.append(time.time() - t0_bc)
                 cumulative_gas += gas_used
                 if ok:
-                    accepted_weights.append(w)
+                    accepted_weights.append(honest_updates[worker_addr])
                     accepted_counts.append(honest_sample_counts[cid])
-            else:
-                accepted_weights.append(w)
-                accepted_counts.append(honest_sample_counts[cid])
-
-        # --- Sybil nodes: random-noise updates injected from attack_start_round ---
-        if attack_active:
-            for worker_addr in sybil_workers:
-                noisy_update = sybil_noise_update(global_model.state_dict())
-                if enforce_identity:
-                    fake_cid = f"Qm{round_idx}_sybil_{worker_addr[:8]}"
-                    ok, gas_used = bc.submit_hash(worker_addr, fake_cid)
-                    cumulative_gas += gas_used  # 0 for reverted calls in blockchain_manager
-                    if ok:
-                        accepted_weights.append(noisy_update)  # never happens: no VC
-                        accepted_counts.append(sybil_claimed_count)
-                else:
-                    accepted_weights.append(noisy_update)
+            for worker_addr, update in sybil_updates.items():
+                fake_cid = f"Qm{round_idx}_sybil_{worker_addr[:8]}"
+                ok, gas_used = bc.submit_hash(worker_addr, fake_cid)
+                cumulative_gas += gas_used  # 0 for reverted calls in blockchain_manager
+                if ok:
+                    accepted_weights.append(update)  # never happens: no VC
                     accepted_counts.append(sybil_claimed_count)
+
+        elif mode == 'pki':
+            for cid, worker_addr in enumerate(honest_workers):
+                if worker_addr in pki_authorized:
+                    accepted_weights.append(honest_updates[worker_addr])
+                    accepted_counts.append(honest_sample_counts[cid])
+            for worker_addr, update in sybil_updates.items():
+                if worker_addr in pki_authorized:
+                    accepted_weights.append(update)  # never happens: not in allowlist
+                    accepted_counts.append(sybil_claimed_count)
+
+        elif mode == 'reputation':
+            candidates = [
+                (worker_addr, honest_updates[worker_addr], honest_sample_counts[cid])
+                for cid, worker_addr in enumerate(honest_workers)
+            ] + [
+                (worker_addr, update, sybil_claimed_count)
+                for worker_addr, update in sybil_updates.items()
+            ]
+            flats = {addr: flatten_state_dict(upd) for addr, upd, _ in candidates}
+            reference = torch.median(torch.stack(list(flats.values())), dim=0).values
+
+            for addr, upd, count in candidates:
+                if trust_scores[addr] >= args['reputation_participation_threshold']:
+                    accepted_weights.append(upd)
+                    accepted_counts.append(count)
+                # Trust is updated AFTER this round's gating decision, so a
+                # newly-attacking node is still included in the round it
+                # first misbehaves — the detection lag being measured.
+                sim = F.cosine_similarity(
+                    flats[addr].unsqueeze(0), reference.unsqueeze(0)
+                ).item()
+                if sim >= args['reputation_similarity_threshold']:
+                    trust_scores[addr] = min(1.0, trust_scores[addr] + args['reputation_reward'])
+                else:
+                    trust_scores[addr] = max(0.0, trust_scores[addr] - args['reputation_penalty'])
+
+        elif mode == 'baseline':
+            for cid, worker_addr in enumerate(honest_workers):
+                accepted_weights.append(honest_updates[worker_addr])
+                accepted_counts.append(honest_sample_counts[cid])
+            for update in sybil_updates.values():
+                accepted_weights.append(update)
+                accepted_counts.append(sybil_claimed_count)
+
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
 
         if not accepted_weights:
             continue
@@ -192,6 +268,7 @@ def run_simulation(track_name, enforce_identity, bc, honest_workers, sybil_worke
             'recall': rec,
             'f1': f1,
             'auc': auc_val,
+            'n_accepted': len(accepted_weights),
             'avg_train_time': np.mean(training_times) if training_times else np.nan,
             'avg_blockchain_time': np.mean(blockchain_times) if blockchain_times else np.nan,
             'cumulative_gas': cumulative_gas,
@@ -201,31 +278,52 @@ def run_simulation(track_name, enforce_identity, bc, honest_workers, sybil_worke
     return pd.DataFrame(history)
 
 
-def compare_tracks(df_proposed, df_baseline, last_n_rounds=40):
+def compare_tracks(df_a, df_b, name_a, name_b, last_n_rounds=40):
     """
-    Statistical comparison of the two tracks' accuracy over the final
-    `last_n_rounds` rounds (Sec. 5.2 reports this over the final 40 rounds).
-    Both series come from real simulation runs — no synthetic baseline.
+    Welch's t-test + Cohen's d comparing two tracks' accuracy over the final
+    `last_n_rounds` rounds. Both series come from real simulation runs.
     """
-    print("\n--- STATISTICAL ANALYSIS (real baseline vs. real proposed run) ---")
+    acc_a = df_a['accuracy'].values[-last_n_rounds:]
+    acc_b = df_b['accuracy'].values[-last_n_rounds:]
 
-    acc_proposed = df_proposed['accuracy'].values[-last_n_rounds:]
-    acc_baseline = df_baseline['accuracy'].values[-last_n_rounds:]
+    t_stat, p_val = stats.ttest_ind(acc_a, acc_b, equal_var=False)
 
-    t_stat, p_val = stats.ttest_ind(acc_proposed, acc_baseline, equal_var=False)
-
-    n1, n2 = len(acc_proposed), len(acc_baseline)
+    n1, n2 = len(acc_a), len(acc_b)
     pooled_std = np.sqrt(
-        ((n1 - 1) * acc_proposed.std(ddof=1) ** 2 + (n2 - 1) * acc_baseline.std(ddof=1) ** 2)
+        ((n1 - 1) * acc_a.std(ddof=1) ** 2 + (n2 - 1) * acc_b.std(ddof=1) ** 2)
         / (n1 + n2 - 2)
     )
-    cohens_d = (acc_proposed.mean() - acc_baseline.mean()) / pooled_std if pooled_std > 0 else np.nan
+    cohens_d = (acc_a.mean() - acc_b.mean()) / pooled_std if pooled_std > 0 else np.nan
 
-    print(f"  Proposed mean accuracy (last {last_n_rounds} rounds): {acc_proposed.mean():.4f}")
-    print(f"  Baseline mean accuracy (last {last_n_rounds} rounds): {acc_baseline.mean():.4f}")
-    print(f"  t = {t_stat:.4f}, p = {p_val:.3e}, Cohen's d = {cohens_d:.4f}")
+    print(f"  {name_a} vs {name_b} (last {last_n_rounds} rounds): "
+          f"mean_a={acc_a.mean():.4f}, mean_b={acc_b.mean():.4f}, "
+          f"t={t_stat:.4f}, p={p_val:.3e}, d={cohens_d:.4f}")
 
     return t_stat, p_val, cohens_d
+
+
+def detection_window(df, attack_start_round, pre_attack_value, metric='auc', tolerance=0.02):
+    """
+    Counts how many rounds after `attack_start_round` a track's `metric`
+    stays below (pre_attack_value - tolerance) before recovering and
+    remaining recovered through the end of the run. Used to quantify the
+    "window of vulnerability" that separates reactive defenses
+    (reputation, baseline) from preemptive ones (proposed, pki).
+
+    Returns None if the metric never recovers within the observed rounds.
+    """
+    post = df[df['round'] >= attack_start_round].reset_index(drop=True)
+    threshold = pre_attack_value - tolerance
+
+    below = post[metric] < threshold
+    if not below.any():
+        return 0  # never dipped below threshold at all
+
+    last_bad_idx = below[below].index.max()
+    # Confirm it stays recovered afterward (no relapse to the end of the run).
+    if (post[metric].iloc[last_bad_idx + 1:] < threshold).any():
+        return None  # never durably recovers
+    return int(post['round'].iloc[last_bad_idx] - attack_start_round + 1)
 
 
 def main():
@@ -248,7 +346,9 @@ def main():
         for i in range(ARGS['num_honest'] + 1, ARGS['num_honest'] + ARGS['num_sybils'] + 1)
     ]
 
-    print("\nOnboarding: issuing credentials to honest hospitals only.")
+    print("\nOnboarding: issuing on-chain credentials to honest hospitals only "
+          "(used by the 'proposed' track; 'pki' uses an equivalent off-chain "
+          "allowlist; 'reputation' and 'baseline' perform no identity check).")
     for worker in honest_workers:
         bc.issue_credential(worker)
     print(f"{len(sybil_workers)} Sybil nodes were NOT issued credentials.")
@@ -258,25 +358,36 @@ def main():
     )
     input_dim = X_train.shape[1]
 
-    print("\n=== Track 1/2: PROPOSED (identity-verified) ===")
-    df_proposed = run_simulation(
-        'proposed', True, bc, honest_workers, sybil_workers,
-        client_data, X_test, y_test, input_dim, ARGS
-    )
+    tracks = [
+        ('proposed', 'proposed'),
+        ('pki', 'pki'),
+        ('reputation', 'reputation'),
+        ('baseline', 'baseline'),
+    ]
+    results = {}
+    for i, (label, mode) in enumerate(tracks, 1):
+        print(f"\n=== Track {i}/{len(tracks)}: {label.upper()} ===")
+        df = run_simulation(label, mode, bc, honest_workers, sybil_workers,
+                             client_data, X_test, y_test, input_dim, ARGS)
+        df.to_csv(f'tbfl_results_{label}.csv', index=False)
+        results[label] = df
+    print("\nResults saved to tbfl_results_{proposed,pki,reputation,baseline}.csv")
 
-    print("\n=== Track 2/2: BASELINE (standard FedAvg, no identity verification) ===")
-    df_baseline = run_simulation(
-        'baseline', False, bc, honest_workers, sybil_workers,
-        client_data, X_test, y_test, input_dim, ARGS
-    )
+    print("\n--- STATISTICAL ANALYSIS (final 40 rounds, real simulation runs) ---")
+    compare_tracks(results['proposed'], results['baseline'], 'proposed', 'baseline', last_n_rounds=40)
+    compare_tracks(results['proposed'], results['pki'], 'proposed', 'pki', last_n_rounds=40)
+    compare_tracks(results['proposed'], results['reputation'], 'proposed', 'reputation', last_n_rounds=40)
 
-    df_proposed.to_csv('tbfl_results_proposed.csv', index=False)
-    df_baseline.to_csv('tbfl_results_baseline.csv', index=False)
-    print("\nResults saved to tbfl_results_proposed.csv / tbfl_results_baseline.csv")
+    print("\n--- WINDOW OF VULNERABILITY (rounds of degraded AUC after attack starts) ---")
+    pre_attack_auc = results['proposed'][
+        results['proposed']['round'] < ARGS['attack_start_round']
+    ]['auc'].iloc[-1]
+    for label in ['proposed', 'pki', 'reputation', 'baseline']:
+        window = detection_window(results[label], ARGS['attack_start_round'], pre_attack_auc)
+        window_str = 'never recovers' if window is None else f'{window} round(s)'
+        print(f"  {label}: {window_str}")
 
-    compare_tracks(df_proposed, df_baseline, last_n_rounds=40)
-
-    total_cost = df_proposed['cumulative_cost_usd'].iloc[-1]
+    total_cost = results['proposed']['cumulative_cost_usd'].iloc[-1]
     print(f"\nTotal on-chain cost over {ARGS['rounds']} rounds (proposed system): "
           f"${total_cost:.2f} (20 Gwei, ETH=${ETH_USD})")
 
